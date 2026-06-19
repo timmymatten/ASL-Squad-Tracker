@@ -1,5 +1,6 @@
 import streamlit as st
 import uuid
+import random
 from datetime import date
 
 from core.constants import GROUP_LABELS, GROUP_COLORS
@@ -13,6 +14,7 @@ from core.algorithms import (
     pick_sitter,
     player_attendance,
     select_players_for_session,
+    PAIRING_SLACK,
 )
 
 
@@ -283,8 +285,13 @@ def _step_squads(match, players):
         st.rerun()
 
 
-def _pairing_context(match, players):
-    """Compute shared context needed by both auto and manual pairing modes."""
+def _pairing_context(match, players, seed=0):
+    """
+    Compute shared context needed by both auto and manual pairing modes.
+
+    seed makes sitter selection reproducible for a given render so the displayed setup
+    is exactly what gets committed; bumping it (via Regenerate) reshuffles the sitter.
+    """
     squad_a = match["squad_a"]
     squad_b = match["squad_b"]
     games = match["games"]
@@ -304,11 +311,12 @@ def _pairing_context(match, players):
     active_b = list(squad_b)
     sit_a = sit_b = None
 
+    rng = random.Random(seed)
     if len(active_a) % 2:
-        sit_a = pick_sitter(active_a, sit_hist_a)
+        sit_a = pick_sitter(active_a, sit_hist_a, rng=rng)
         active_a = [p for p in active_a if p != sit_a]
     if len(active_b) % 2:
-        sit_b = pick_sitter(active_b, sit_hist_b)
+        sit_b = pick_sitter(active_b, sit_hist_b, rng=rng)
         active_b = [p for p in active_b if p != sit_b]
 
     # Use manually set rank order if present, otherwise fall back to skill-group order
@@ -378,8 +386,14 @@ def _step_pairing(match, players):
     game_num = len(games) + 1
     st.subheader(f"Game {game_num} — Pairings")
 
+    # Nonce drives matchup variation. It only changes when Regenerate is pressed, so the
+    # setup stays stable across reruns (e.g. clicking Start Game commits what's shown).
+    # Scoped to this match + game so it resets cleanly for each new game / match day.
+    nonce_key = f"pair_nonce_{match['id']}_{game_num}"
+    nonce = st.session_state.get(nonce_key, 0)
+
     active_a, active_b, sit_a, sit_b, ranks_a, ranks_b, forbidden_a, forbidden_b = \
-        _pairing_context(match, players)
+        _pairing_context(match, players, seed=nonce)
 
     if sit_a:
         st.info(f"🪑 **Squad A sitting:** {players[sit_a]['name']}")
@@ -390,8 +404,11 @@ def _step_pairing(match, players):
 
     # ── Auto tab ──────────────────────────────────────────────────────────────
     with tab_auto:
-        pairs_a = find_best_pairing(active_a, ranks_a, forbidden_a)
-        pairs_b = find_best_pairing(active_b, ranks_b, forbidden_b)
+        # nonce 0 → the optimal matchup; each Regenerate rotates to a different
+        # near-optimal one (within PAIRING_SLACK of the best spread).
+        variant = None if nonce == 0 else nonce
+        pairs_a = find_best_pairing(active_a, ranks_a, forbidden_a, variant=variant, slack=PAIRING_SLACK)
+        pairs_b = find_best_pairing(active_b, ranks_b, forbidden_b, variant=variant, slack=PAIRING_SLACK)
 
         if not pairs_a or not pairs_b:
             st.error("Could not generate pairings — squad too small?")
@@ -416,6 +433,7 @@ def _step_pairing(match, players):
         c1, c2 = st.columns(2)
         with c1:
             if st.button("🔄 Regenerate", key="auto_regen"):
+                st.session_state[nonce_key] = nonce + 1
                 st.rerun()
         with c2:
             if st.button("▶️ Start Game", type="primary", key="auto_start"):

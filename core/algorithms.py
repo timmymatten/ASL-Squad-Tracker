@@ -30,33 +30,45 @@ def _spread(pairs, ranks):
     return max(scores) - min(scores)
 
 
-def find_best_pairing(active_squad, ranks, forbidden):
+PAIRING_SLACK = 2  # how far above the best pair-score spread an alternate matchup may stray
+
+
+def find_best_pairing(active_squad, ranks, forbidden, variant=None, slack=PAIRING_SLACK):
     """
-    Find the perfect matching of active_squad with minimum pair-score spread
-    that avoids all forbidden frozensets.  Falls back without forbidden
-    constraint if no valid matching exists.
+    Return a perfect matching of active_squad that avoids all forbidden frozensets
+    (falling back to ignoring forbidden if none qualify).
+
+    variant=None (default): deterministic — the minimum pair-score-spread matching.
+        Identical to the original behavior.
+    variant=<int>: pick from the near-optimal matchings (spread within `slack` of the
+        best), rotating by the integer so consecutive values yield different — and not
+        necessarily zero-spread — matchups. Powers the UI's "Regenerate" button.
     """
-    best, best_spread = None, float("inf")
-    checked = 0
     LIMIT = 10_000  # cap for very large squads
 
-    def search(relax=False):
-        nonlocal best, best_spread, checked
-        for matching in _perfect_matchings(list(active_squad)):
-            checked += 1
-            if checked > LIMIT:
+    def collect(relax):
+        out = []
+        for i, matching in enumerate(_perfect_matchings(list(active_squad))):
+            if i >= LIMIT:
                 break
             if not relax and any(frozenset(p) in forbidden for p in matching):
                 continue
-            sp = _spread(matching, ranks)
-            if sp < best_spread:
-                best_spread = sp
-                best = matching
+            out.append(matching)
+        return out
 
-    search(relax=False)
-    if best is None:
-        search(relax=True)
-    return best
+    candidates = collect(relax=False) or collect(relax=True)
+    if not candidates:
+        return None
+
+    spreads = [_spread(m, ranks) for m in candidates]
+    best_spread = min(spreads)
+
+    if variant is None:
+        return candidates[spreads.index(best_spread)]
+
+    pool = [m for m, sp in zip(candidates, spreads) if sp <= best_spread + slack]
+    pool.sort(key=lambda m: _spread(m, ranks))
+    return pool[variant % len(pool)]
 
 
 def generate_squads(present_ids, players):
@@ -85,11 +97,13 @@ def generate_squads(present_ids, players):
     return squad_a, squad_b
 
 
-def pick_sitter(squad_ids, sit_history):
+def pick_sitter(squad_ids, sit_history, rng=None):
     """
     Rotate sitters so no player sits more than 2 games in a row.
     sit_history is an ordered list of pids who sat (oldest first).
+    Pass rng (a random.Random) to make the tie-break reproducible.
     """
+    rng = rng or random
     consec = {}
     for pid in squad_ids:
         cnt = 0
@@ -103,7 +117,7 @@ def pick_sitter(squad_ids, sit_history):
     eligible = [p for p in squad_ids if consec[p] < 2] or list(squad_ids)
     never = [p for p in eligible if p not in sit_history]
     if never:
-        return random.choice(never)
+        return rng.choice(never)
     last_idx = {p: max(i for i, x in enumerate(sit_history) if x == p) for p in eligible}
     return min(last_idx, key=last_idx.get)
 
