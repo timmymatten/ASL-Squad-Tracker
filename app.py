@@ -26,7 +26,7 @@ def main():
     }
 
     with st.sidebar:
-        st.markdown("# 🥏 ASL Squad Tracker")
+        st.markdown("# 🏐 ASL Squad Tracker")
         st.caption("Northeastern Club Roundnet")
         st.divider()
         page = st.radio("", list(pages.keys()), label_visibility="collapsed")
