@@ -17,6 +17,8 @@ build/
 
 # App data (local state — use empty default on first run)
 data.json
+data_sample.json
+data.json.bak
 
 # IDE / editor
 .idea/
