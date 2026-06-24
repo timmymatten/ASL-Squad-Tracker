@@ -203,25 +203,18 @@ def compute_stats(data):
         for pid, p in players.items()
     }
 
+    def pair_group(pair):
+        """Average skill group of a pair (lower = stronger). None if unknown."""
+        gs = [players[p]["group"] for p in pair if p in players]
+        return sum(gs) / len(gs) if gs else None
+
     for md in data["match_days"]:
         if not md.get("completed"):
             continue
 
-        squad_a = set(md.get("squad_a", []))
-        squad_b = set(md.get("squad_b", []))
-
         for pid in md.get("present", []):
             if pid in stats:
                 stats[pid]["attendance"] += 1
-
-        def avg_group(sq):
-            gs = [players[p]["group"] for p in sq if p in players]
-            return sum(gs) / len(gs) if gs else 0
-
-        avg_a = avg_group(squad_a)
-        avg_b = avg_group(squad_b)
-
-        md_net_a = md_net_b = 0
 
         for game in md.get("games", []):
             results = game.get("results") or []
@@ -245,33 +238,27 @@ def compute_stats(data):
                             stats[pid]["points_against"] += a_pts
 
                 if winner == "A":
-                    md_net_a += 1
-                    for pid in pa_pair:
-                        if pid in stats:
-                            stats[pid]["wins"] += 1
-                            stats[pid]["games"] += 1
-                    for pid in pb_pair:
-                        if pid in stats:
-                            stats[pid]["games"] += 1
+                    win_pair, lose_pair = pa_pair, pb_pair
                 elif winner == "B":
-                    md_net_b += 1
-                    for pid in pb_pair:
-                        if pid in stats:
-                            stats[pid]["wins"] += 1
-                            stats[pid]["games"] += 1
-                    for pid in pa_pair:
-                        if pid in stats:
-                            stats[pid]["games"] += 1
+                    win_pair, lose_pair = pb_pair, pa_pair
+                else:
+                    continue
 
-        # Upset: weaker squad (higher avg group #) won more nets
-        if md_net_a != md_net_b:
-            winning_sq = squad_a if md_net_a > md_net_b else squad_b
-            winning_avg = avg_a if md_net_a > md_net_b else avg_b
-            losing_avg = avg_b if md_net_a > md_net_b else avg_a
-            if winning_avg > losing_avg:  # winner had worse avg skill
-                for pid in winning_sq:
+                for pid in win_pair:
                     if pid in stats:
-                        stats[pid]["upsets"] += 1
+                        stats[pid]["wins"] += 1
+                        stats[pid]["games"] += 1
+                for pid in lose_pair:
+                    if pid in stats:
+                        stats[pid]["games"] += 1
+
+                # Individual upset: the winning pair was weaker on paper — a higher
+                # average skill group than the pair it beat on this net.
+                wg, lg = pair_group(win_pair), pair_group(lose_pair)
+                if wg is not None and lg is not None and wg > lg:
+                    for pid in win_pair:
+                        if pid in stats:
+                            stats[pid]["upsets"] += 1
 
     for s in stats.values():
         s["point_diff"] = s["points_for"] - s["points_against"]
