@@ -6,6 +6,7 @@ from views.roster import page_roster
 from views.match_day import page_match_day
 from views.leaderboard import page_leaderboard
 from views.chemistry import page_chemistry
+from views.player import page_player
 from views.history import page_history
 
 
@@ -22,6 +23,7 @@ def main():
         "🎯 Match Day": page_match_day,
         "🏆 Leaderboard": page_leaderboard,
         "🤝 Chemistry": page_chemistry,
+        "👤 Player": page_player,
         "📅 History": page_history,
     }
 

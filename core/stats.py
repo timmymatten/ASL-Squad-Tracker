@@ -44,6 +44,84 @@ def partnership_stats(data):
     return pairs
 
 
+# ─── Head-to-head ─────────────────────────────────────────────────────────────
+
+
+def head_to_head_stats(data):
+    """
+    Each player's record against every opponent they've faced.
+
+    Returns {pid: {opp_pid: {"games", "wins", "point_diff"}}}. For every net, each
+    A-side player is credited a game against each B-side player (win if "A" won, margin
+    a_pts - b_pts) and vice-versa. Records are directional (X-vs-Y mirrors Y-vs-X).
+    Mirrors compute_stats's replay + score guard.
+    """
+    h2h = {}
+
+    def record(x, y, won, margin):
+        rec = h2h.setdefault(x, {}).setdefault(y, {"games": 0, "wins": 0, "point_diff": 0})
+        rec["games"] += 1
+        rec["wins"] += 1 if won else 0
+        rec["point_diff"] += margin
+
+    for md in data["match_days"]:
+        if not md.get("completed"):
+            continue
+        for game in md.get("games", []):
+            results = game.get("results") or []
+            scores = game.get("scores") or []
+            pairings_a = game.get("pairings_a", [])
+            pairings_b = game.get("pairings_b", [])
+
+            for i, winner in enumerate(results):
+                a_pts, b_pts = scores[i] if i < len(scores) else (0, 0)
+                team_a = pairings_a[i] if i < len(pairings_a) else []
+                team_b = pairings_b[i] if i < len(pairings_b) else []
+                for x in team_a:
+                    for y in team_b:
+                        record(x, y, winner == "A", a_pts - b_pts)
+                        record(y, x, winner == "B", b_pts - a_pts)
+
+    return h2h
+
+
+def player_timeline(data, pid):
+    """
+    One chronological entry per completed match day the player appeared in, aggregating
+    that player's nets that day: {"date", "games", "wins", "point_diff"}.
+    """
+    timeline = []
+    for md in data["match_days"]:
+        if not md.get("completed"):
+            continue
+        games_n = wins_n = diff_n = 0
+        for game in md.get("games", []):
+            results = game.get("results") or []
+            scores = game.get("scores") or []
+            pairings_a = game.get("pairings_a", [])
+            pairings_b = game.get("pairings_b", [])
+            for i, winner in enumerate(results):
+                a_pts, b_pts = scores[i] if i < len(scores) else (0, 0)
+                team_a = pairings_a[i] if i < len(pairings_a) else []
+                team_b = pairings_b[i] if i < len(pairings_b) else []
+                if pid in team_a:
+                    games_n += 1
+                    wins_n += 1 if winner == "A" else 0
+                    diff_n += a_pts - b_pts
+                elif pid in team_b:
+                    games_n += 1
+                    wins_n += 1 if winner == "B" else 0
+                    diff_n += b_pts - a_pts
+        if games_n:
+            timeline.append({
+                "date": md.get("date", ""),
+                "games": games_n,
+                "wins": wins_n,
+                "point_diff": diff_n,
+            })
+    return timeline
+
+
 # ─── Promotion suggestions ──────────────────────────────────────────────────
 # Squad/pairing balancing pushes every net toward a coin flip, so a player who
 # keeps winning well above even despite balancing is under-ranked → promote.
