@@ -1,8 +1,8 @@
 GROUP_LABELS = {
-    1: "Group 1 — Elite",
-    2: "Group 2 — Advanced",
-    3: "Group 3 — Intermediate",
-    4: "Group 4 — Beginner",
+    1: "Group 1 — Premier/Bronze+",
+    2: "Group 2 — Contender",
+    3: "Group 3 — Intermediate/Advanced",
+    4: "Group 4 — Rookies",
 }
 GROUP_COLORS = {1: "🔴", 2: "🟠", 3: "🟡", 4: "🟢"}
 
