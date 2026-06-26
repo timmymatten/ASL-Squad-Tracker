@@ -31,6 +31,7 @@ def _spread(pairs, ranks):
 
 
 PAIRING_SLACK = 2  # how far above the best pair-score spread an alternate matchup may stray
+NET_VARIANCE_MAX = 3  # max allowed gap between opposing pair rank-sums on a net
 
 
 def find_best_pairing(active_squad, ranks, forbidden, variant=None, slack=PAIRING_SLACK):
