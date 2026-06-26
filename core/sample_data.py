@@ -14,12 +14,11 @@ same gentle tilt you'd see IRL despite balanced squads.
 
 No Streamlit dependency, so it stays importable from a plain CLI.
 """
-import json
 import random
 import uuid
 from datetime import date, timedelta
 
-from core.constants import DATA_FILES
+from core import storage
 from core.algorithms import (
     generate_squads,
     find_best_pairing,
@@ -145,17 +144,17 @@ def _simulate_match_day(d, players, active, attend_rate, match_days_so_far):
 
 def generate_sample(n_match_days=N_MATCH_DAYS, seed=None):
     """
-    Build data_sample.json from the real roster. Returns a summary dict:
+    Build the 'sample' dataset from the real roster. Returns a summary dict:
         {"match_days", "games", "nets", "players"}.
 
-    Reads only the real file (for the roster); writes only the sample file.
+    Reads only the 'real' dataset (for the roster); writes only the 'sample' dataset.
+    Backend (Supabase or local file) is whatever core.storage is configured for.
     Pass seed=<int> for reproducible output; seed=None gives fresh data each call.
     """
     if seed is not None:
         random.seed(seed)
 
-    with open(DATA_FILES["real"]) as f:
-        source = json.load(f)
+    source = storage.read_dataset("real")
     players = source["players"]
     active = [pid for pid, p in players.items() if p.get("active")]
 
@@ -174,8 +173,7 @@ def generate_sample(n_match_days=N_MATCH_DAYS, seed=None):
         synthetic.append(_simulate_match_day(d, players, active, attend_rate, synthetic))
 
     sample = {"players": players, "match_days": synthetic}
-    with open(DATA_FILES["sample"], "w") as f:
-        json.dump(sample, f, indent=2)
+    storage.write_dataset("sample", sample)
 
     return {
         "match_days": len(synthetic),
