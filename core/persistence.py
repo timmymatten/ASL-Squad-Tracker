@@ -1,19 +1,15 @@
 import streamlit as st
-import json
-import os
 
 # "real" is your live data; "sample" is throwaway test data (see core/sample_data.py).
-# Each persists only to its own file, so switching between them in the sidebar can never
-# let one contaminate the other. Paths live in core.constants (no Streamlit dependency).
+# Each dataset persists independently, so switching in the sidebar can never let one
+# contaminate the other. Reads/writes go through core.storage (Supabase if configured,
+# else local JSON files); dataset names live in core.constants (no Streamlit dependency).
 from core.constants import DATA_FILES, DEFAULT_DATASET
+from core import storage
 
 
 def active_dataset():
     return st.session_state.get("dataset", DEFAULT_DATASET)
-
-
-def data_path():
-    return DATA_FILES[active_dataset()]
 
 
 def set_dataset(name):
@@ -21,7 +17,7 @@ def set_dataset(name):
     if name not in DATA_FILES:
         return
     st.session_state.dataset = name
-    # Force a reload from the new file and abandon any in-progress match so the
+    # Force a reload from the new dataset and abandon any in-progress match so the
     # two datasets never share live state.
     st.session_state.pop("data", None)
     st.session_state.pop("data_for", None)
@@ -29,16 +25,11 @@ def set_dataset(name):
 
 
 def load_data():
-    path = data_path()
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return {"players": {}, "match_days": []}
+    return storage.read_dataset(active_dataset())
 
 
 def save_data(data):
-    with open(data_path(), "w") as f:
-        json.dump(data, f, indent=2)
+    storage.write_dataset(active_dataset(), data)
 
 
 def get_data():

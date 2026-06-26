@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 
 from core.persistence import get_data, active_dataset, set_dataset, DATA_FILES
@@ -17,6 +18,16 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded",
     )
+
+    # Bridge Streamlit secrets → env so core.storage (which reads os.environ) can reach
+    # Supabase on Streamlit Cloud. Guarded: no secrets → falls back to local JSON files.
+    # Must come after set_page_config (st.secrets access counts as a Streamlit command).
+    try:
+        for _k in ("SUPABASE_URL", "SUPABASE_KEY"):
+            if _k in st.secrets:
+                os.environ.setdefault(_k, st.secrets[_k])
+    except Exception:
+        pass
 
     pages = {
         "📋 Roster": page_roster,
@@ -54,7 +65,7 @@ def main():
             index=list(DATA_FILES.keys()).index(current),
             format_func=lambda k: labels[k],
             help="Switch between your real data and throwaway test data. "
-                 "Each saves to its own file — they never mix.",
+                 "Each is stored separately — they never mix.",
         )
         if choice != current:
             set_dataset(choice)
@@ -72,7 +83,9 @@ def main():
                     f"{summary['games']} games."
                 )
                 st.rerun()
-        st.caption(f"File: `{DATA_FILES[current]}`")
+        from core import storage
+        backend = "Supabase" if storage.using_supabase() else f"local `{DATA_FILES[current]}`"
+        st.caption(f"Storage: {backend}")
 
         st.divider()
         data = get_data()
