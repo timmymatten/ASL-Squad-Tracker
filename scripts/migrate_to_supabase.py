@@ -1,18 +1,20 @@
 """
 One-time migration: push local JSON datasets into Supabase.
 
-Usage:
-    export SUPABASE_URL="https://<project>.supabase.co"
-    export SUPABASE_KEY="<service-role key>"
-    python migrate_to_supabase.py
+Run from the repo root (credentials via .streamlit/secrets.toml or env vars):
+    python scripts/migrate_to_supabase.py
 
 Reads the local data.json ('real') and data_sample.json ('sample') and upserts each as a
-jsonb blob into the `datasets` table (see DEPLOY.md for the table SQL). A dataset whose
-local file is missing is skipped. Safe to re-run (upsert overwrites the row).
+jsonb blob into the `datasets` table (see docs/DEPLOY.md for the table SQL). A dataset
+whose local file is missing is skipped. Safe to re-run (upsert overwrites the row).
 """
 import json
 import os
 import sys
+
+# Allow running as `python scripts/migrate_to_supabase.py` from the repo root by putting
+# the project root (this file's parent's parent) on the import path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.constants import DATA_FILES
 from core import storage

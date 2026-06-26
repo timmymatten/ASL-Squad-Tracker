@@ -27,7 +27,7 @@ present. Pick **one** way to supply credentials:
 pip install -r requirements.txt
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 # edit .streamlit/secrets.toml and paste your real URL + service-role key
-python migrate_to_supabase.py
+python scripts/migrate_to_supabase.py
 ```
 
 **Option B — environment variables (note: NO spaces around `=`):**
@@ -35,7 +35,7 @@ python migrate_to_supabase.py
 pip install -r requirements.txt
 export SUPABASE_URL="https://<project-ref>.supabase.co"
 export SUPABASE_KEY="<service-role key>"
-python migrate_to_supabase.py
+python scripts/migrate_to_supabase.py
 ```
 
 You should see two `datasets` rows in the Supabase Table Editor. (Skip this if you'd

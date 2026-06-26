@@ -3,7 +3,7 @@ Generate the SAMPLE dataset (data_sample.json) full of realistic history.
 
 This NEVER touches your real data — it only reads the player roster from the real file,
 then writes synthetic match days to the sample file. Callable from the app (sidebar
-"Regenerate" button) or the command line (seed_sample_data.py).
+"Regenerate" button) or the command line (scripts/seed_sample_data.py).
 
 Realism guarantee: this reuses the *exact* match-day pipeline the app uses
 (generate_squads, pick_sitter, find_best_pairing, sort_pairs_by_score, the 16-player
