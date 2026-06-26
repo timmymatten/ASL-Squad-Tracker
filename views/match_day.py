@@ -6,6 +6,7 @@ from datetime import date
 from core.constants import GROUP_LABELS, GROUP_COLORS
 from core.persistence import get_data, persist
 from core.match_state import get_match, set_match
+from core.stats import compute_stats, squad_order, order_strength, MIN_ORDER_GAMES
 from core.algorithms import (
     generate_squads,
     _enforce_gender_balance,
@@ -15,6 +16,7 @@ from core.algorithms import (
     player_attendance,
     select_players_for_session,
     PAIRING_SLACK,
+    NET_VARIANCE_MAX,
 )
 
 
@@ -136,8 +138,6 @@ def page_match_day():
                 "present": present,
                 "squad_a": squad_a,
                 "squad_b": squad_b,
-                "rank_a": _default_rank_order(squad_a, players),
-                "rank_b": _default_rank_order(squad_b, players),
                 "games": [],
                 "squad_wins": {"a": 0, "b": 0},
                 "completed": False,
@@ -145,11 +145,6 @@ def page_match_day():
             }
         )
         st.rerun()
-
-
-def _default_rank_order(squad_ids, players):
-    """Default rank: sort by skill group then name (group 1 = rank 1)."""
-    return sorted(squad_ids, key=lambda p: (players[p]["group"], players[p]["name"]))
 
 
 def _squad_display(squad_ids, players, label, color):
@@ -185,46 +180,16 @@ def _match_in_progress(data, match, players):
         st.rerun()
 
 
-@st.fragment
-def _rank_list_fragment(rank_key, col_key):
-    """Rank-ordered player list with ↑/↓ buttons. Fragment = no scroll-to-top."""
-    match = get_match()
-    data = get_data()
-    players = data["players"]
-    if not match:
-        return
-    order = list(match.get(rank_key) or [])
-    for i, pid in enumerate(order):
-        p = players[pid]
-        c_name, c_up, c_dn = st.columns([5, 1, 1])
-        c_name.write(f"**#{i+1}** {GROUP_COLORS[p['group']]} {p['name']} — G{p['group']}")
-        if i > 0:
-            if c_up.button("↑", key=f"{col_key}_up_{pid}", help="Move up"):
-                order[i], order[i - 1] = order[i - 1], order[i]
-                match[rank_key] = order
-                set_match(match)
-                st.rerun()
-        if i < len(order) - 1:
-            if c_dn.button("↓", key=f"{col_key}_dn_{pid}", help="Move down"):
-                order[i], order[i + 1] = order[i + 1], order[i]
-                match[rank_key] = order
-                set_match(match)
-                st.rerun()
-
-
 def _step_squads(match, players):
     squad_a = match["squad_a"]
     squad_b = match["squad_b"]
 
-    # Ensure rank lists exist (backward compat)
-    if "rank_a" not in match:
-        match["rank_a"] = _default_rank_order(squad_a, players)
-    if "rank_b" not in match:
-        match["rank_b"] = _default_rank_order(squad_b, players)
-
     # ── Swap players ──────────────────────────────────────────────────────────
     st.subheader("Adjust Squads")
-    st.caption("Swap players between squads, then set each squad's rank order.")
+    st.caption(
+        "Swap players between squads if needed. Pairings are built automatically — "
+        "no manual ranking. The order used is shown below."
+    )
 
     def pid_label(pid):
         p = players[pid]
@@ -252,34 +217,40 @@ def _step_squads(match, players):
         if pa and pb:
             squad_a.remove(pa); squad_b.remove(pb)
             squad_a.append(pb); squad_b.append(pa)
-            match["rank_a"].remove(pa); match["rank_b"].remove(pb)
-            match["rank_a"].append(pb); match["rank_b"].append(pa)
         elif pa:
             squad_a.remove(pa); squad_b.append(pa)
-            match["rank_a"].remove(pa); match["rank_b"].append(pa)
         elif pb:
             squad_b.remove(pb); squad_a.append(pb)
-            match["rank_b"].remove(pb); match["rank_a"].append(pb)
         match["squad_a"] = squad_a
         match["squad_b"] = squad_b
         set_match(match)
         st.rerun()
 
-    # ── Rank ordering ─────────────────────────────────────────────────────────
+    # ── Pairing order (transparent) ────────────────────────────────────────────
     st.divider()
-    st.subheader("Set Rank Order")
-    st.caption("Rank 1 = best player. Pairs are built using these ranks.")
-
+    st.caption(
+        "**Pairing order:** by skill group, then by **average point differential per "
+        f"game** (Leaderboard +/− ÷ games). Players with under {MIN_ORDER_GAMES} games "
+        "sit in the middle until they've played enough. Pairs put a stronger player with "
+        "a developing one, and nets are matched evenly."
+    )
+    stats = compute_stats(get_data())
     col_a, col_b = st.columns(2)
-    with col_a:
-        st.markdown("**🔵 Squad A**")
-        _rank_list_fragment("rank_a", "ra")
-    with col_b:
-        st.markdown("**🔴 Squad B**")
-        _rank_list_fragment("rank_b", "rb")
+    for col, squad, label, color in (
+        (col_a, squad_a, "Squad A", "🔵"),
+        (col_b, squad_b, "Squad B", "🔴"),
+    ):
+        with col:
+            st.markdown(f"**{color} {label}**")
+            for pid in squad_order(squad, stats, players):
+                p = players[pid]
+                g = stats[pid]["games"]
+                metric = f"{order_strength(pid, stats):+.1f}/game" if g >= MIN_ORDER_GAMES \
+                    else f"new ({g} g)"
+                st.write(f"{GROUP_COLORS[p['group']]} {p['name']} — G{p['group']} · {metric}")
 
     st.divider()
-    if st.button("✅ Confirm Squads & Rankings — Begin Match!", type="primary"):
+    if st.button("✅ Confirm Squads — Begin Match!", type="primary"):
         match["step"] = "pairing"
         set_match(match)
         st.rerun()
@@ -319,20 +290,28 @@ def _pairing_context(match, players, seed=0):
         sit_b = pick_sitter(active_b, sit_hist_b, rng=rng)
         active_b = [p for p in active_b if p != sit_b]
 
-    # Use manually set rank order if present, otherwise fall back to skill-group order
-    rank_order_a = match.get("rank_a") or _default_rank_order(squad_a, players)
-    rank_order_b = match.get("rank_b") or _default_rank_order(squad_b, players)
-    ranks_a = {pid: i + 1 for i, pid in enumerate(rank_order_a)}
-    ranks_b = {pid: i + 1 for i, pid in enumerate(rank_order_b)}
+    # Transparent within-squad strength: order each squad by skill group, then by raw
+    # point differential (the +/- on the Leaderboard), and turn that order into 1..n
+    # rank weights. No hidden rating — the basis is fully explainable to players.
+    stats = compute_stats(get_data())
+    ranks_a = {pid: i + 1 for i, pid in enumerate(squad_order(squad_a, stats, players))}
+    ranks_b = {pid: i + 1 for i, pid in enumerate(squad_order(squad_b, stats, players))}
 
     return active_a, active_b, sit_a, sit_b, ranks_a, ranks_b, forbidden_a, forbidden_b
 
 
+def _net_gap(pairs_a, pairs_b, ranks_a, ranks_b, i):
+    """Absolute gap between the two pairs' combined ratings on net i."""
+    sa = ranks_a[pairs_a[i][0]] + ranks_a[pairs_a[i][1]]
+    sb = ranks_b[pairs_b[i][0]] + ranks_b[pairs_b[i][1]]
+    return abs(sa - sb)
+
+
 def _check_pairing_rules(pairs_a, pairs_b, ranks_a, ranks_b, forbidden_a, forbidden_b):
     """
-    Return (violations, max_net_diff).
-    Net variance rule: on each net, |score_a - score_b| must not exceed 3.
-    Pairs must be pre-sorted by score before calling so alignment is meaningful.
+    Return (violations, max_net_gap).
+    Net variance rule: on each net, the gap between opposing pairs' combined ratings
+    must not exceed NET_VARIANCE_MAX. Pairs must be pre-sorted by score before calling.
     """
     violations = []
     n_nets = min(len(pairs_a), len(pairs_b))
@@ -345,40 +324,43 @@ def _check_pairing_rules(pairs_a, pairs_b, ranks_a, ranks_b, forbidden_a, forbid
         if frozenset(pair) in forbidden_b:
             violations.append(f"🔴 Squad B Net {i+1}: same pair as last game")
 
-    # Net variance rule: opposing pair scores on the same net must be within 3
-    max_diff = 0
+    # Net variance rule: opposing pairs on the same net must be evenly matched.
+    max_gap = 0.0
     for i in range(n_nets):
-        sa = ranks_a[pairs_a[i][0]] + ranks_a[pairs_a[i][1]]
-        sb = ranks_b[pairs_b[i][0]] + ranks_b[pairs_b[i][1]]
-        diff = abs(sa - sb)
-        max_diff = max(max_diff, diff)
-        if diff > 3:
-            violations.append(
-                f"Net {i+1}: score gap = **{diff}** (A: {sa} vs B: {sb}, rule: ≤ 3)"
-            )
+        gap = _net_gap(pairs_a, pairs_b, ranks_a, ranks_b, i)
+        max_gap = max(max_gap, gap)
+        if gap > NET_VARIANCE_MAX:
+            violations.append(f"Net {i+1}: pairs look mismatched")
 
-    return violations, max_diff
+    return violations, max_gap
 
 
 def _display_pairing_table(pairs_a, pairs_b, ranks_a, ranks_b, players):
+    """Player-facing matchups. Ratings stay hidden; show only an even/mismatch marker."""
     n_nets = min(len(pairs_a), len(pairs_b))
-    hdr = st.columns([1, 4, 3, 4])
+    hdr = st.columns([1, 5, 1, 5])
     hdr[0].markdown("**Net**")
     hdr[1].markdown("**🔵 Squad A**")
-    hdr[2].markdown("**Scores (gap)**")
+    hdr[2].markdown("**Match**")
     hdr[3].markdown("**🔴 Squad B**")
     for i in range(n_nets):
         pa1, pa2 = pairs_a[i]
         pb1, pb2 = pairs_b[i]
-        sa = ranks_a[pa1] + ranks_a[pa2]
-        sb = ranks_b[pb1] + ranks_b[pb2]
-        diff = abs(sa - sb)
-        gap_str = f"A:{sa} B:{sb} Δ{diff}"
-        row = st.columns([1, 4, 3, 4])
+        marker = "⚠️" if _net_gap(pairs_a, pairs_b, ranks_a, ranks_b, i) > NET_VARIANCE_MAX else "✓"
+        row = st.columns([1, 5, 1, 5])
         row[0].write(f"**{i+1}**")
         row[1].write(f"{players[pa1]['name']} & {players[pa2]['name']}")
-        row[2].write(f"{'⚠️ ' if diff > 3 else ''}{gap_str}")
+        row[2].write(marker)
         row[3].write(f"{players[pb1]['name']} & {players[pb2]['name']}")
+
+    # Optional net-balance detail (rank-sum per pair; lower = stronger).
+    with st.expander("Net balance details"):
+        st.caption("Each number is the pair's combined rank (lower = stronger). "
+                   "Opposing pairs are matched to keep these close.")
+        for i in range(n_nets):
+            sa = ranks_a[pairs_a[i][0]] + ranks_a[pairs_a[i][1]]
+            sb = ranks_b[pairs_b[i][0]] + ranks_b[pairs_b[i][1]]
+            st.caption(f"Net {i+1}: A {sa} vs B {sb} · gap {abs(sa - sb)}")
 
 
 def _step_pairing(match, players):
@@ -418,14 +400,14 @@ def _step_pairing(match, players):
         pairs_a = sort_pairs_by_score(pairs_a, ranks_a)
         pairs_b = sort_pairs_by_score(pairs_b, ranks_b)
 
-        violations, max_diff = _check_pairing_rules(
+        violations, _ = _check_pairing_rules(
             pairs_a, pairs_b, ranks_a, ranks_b, forbidden_a, forbidden_b
         )
         if violations:
             for v in violations:
                 st.warning(f"⚠️ {v}")
         else:
-            st.success(f"✅ All rules satisfied — max opposing score gap = **{max_diff}**")
+            st.success("✅ Balanced — nets are evenly matched")
 
         _display_pairing_table(pairs_a, pairs_b, ranks_a, ranks_b, players)
 
@@ -444,7 +426,7 @@ def _step_pairing(match, players):
         n_nets = min(len(active_a), len(active_b)) // 2
         st.caption(
             f"Build {n_nets} pairs per squad. "
-            f"Ranks shown in parentheses (1 = best). "
+            f"Players are ordered strongest-first (by group, then avg point diff/game). "
             f"Rules are checked live."
         )
 
@@ -453,7 +435,7 @@ def _step_pairing(match, players):
 
         def pid_label_ranked(pid, ranks):
             p = players[pid]
-            return f"{p['name']} (rank {ranks[pid]}, G{p['group']})"
+            return f"{p['name']} (G{p['group']})"
 
         manual_pairs_a = []
         manual_pairs_b = []
@@ -517,7 +499,7 @@ def _step_pairing(match, players):
         if valid and len(manual_pairs_a) == n_nets and len(manual_pairs_b) == n_nets:
             sorted_a = sort_pairs_by_score(manual_pairs_a, ranks_a)
             sorted_b = sort_pairs_by_score(manual_pairs_b, ranks_b)
-            violations, max_diff = _check_pairing_rules(
+            violations, _ = _check_pairing_rules(
                 sorted_a, sorted_b,
                 ranks_a, ranks_b,
                 forbidden_a, forbidden_b,
@@ -527,7 +509,7 @@ def _step_pairing(match, players):
                     st.warning(f"⚠️ {v}")
                 st.error("Fix rule violations before starting the game.")
             else:
-                st.success(f"✅ All rules satisfied — max opposing score gap = **{max_diff}**")
+                st.success("✅ Balanced — nets are evenly matched")
                 _display_pairing_table(sorted_a, sorted_b, ranks_a, ranks_b, players)
                 if st.button("▶️ Start Game", type="primary", key="manual_start"):
                     _commit_pairing(match, game_num, sorted_a, sorted_b, sit_a, sit_b)

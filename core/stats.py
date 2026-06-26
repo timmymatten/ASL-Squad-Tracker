@@ -1,3 +1,33 @@
+# ─── Within-squad ordering (transparent: skill group, then avg point diff/game) ─
+
+MIN_ORDER_GAMES = 5  # below this, a player's avg point diff is treated as neutral (0)
+
+
+def order_strength(pid, stats):
+    """Avg point differential per game, or 0 (neutral) until a player has enough games."""
+    s = stats.get(pid, {})
+    g = s.get("games", 0)
+    return s.get("point_diff", 0) / g if g >= MIN_ORDER_GAMES else 0.0
+
+
+def squad_order(squad_ids, stats, players):
+    """
+    Order a squad strongest → weakest, transparently: by skill group first (Group 1 is
+    best), then by average point differential per game (Leaderboard +/- ÷ games). Players
+    with fewer than MIN_ORDER_GAMES games count as neutral, so a small sample can't spike
+    them above established players. Returns the ordered list of pids; the pairing engine
+    turns it into 1..n strength weights. No hidden rating — the basis is fully explainable.
+    """
+    return sorted(
+        squad_ids,
+        key=lambda pid: (
+            players[pid]["group"],
+            -order_strength(pid, stats),
+            players[pid]["name"],
+        ),
+    )
+
+
 # ─── Partner chemistry ──────────────────────────────────────────────────────
 
 MIN_PARTNER_GAMES = 3  # nets a duo must have played together to qualify for the leaderboard
