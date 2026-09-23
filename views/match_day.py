@@ -4,9 +4,10 @@ import random
 from datetime import date
 
 from core.constants import GROUP_LABELS, GROUP_COLORS
-from core.persistence import get_data, persist
+from core.persistence import get_data, persist, get_clustering_mode
 from core.match_state import get_match, set_match
 from core.stats import compute_stats, squad_order, order_strength, MIN_ORDER_GAMES
+from core import clustering
 from core.algorithms import (
     generate_squads,
     _enforce_gender_balance,
@@ -18,6 +19,25 @@ from core.algorithms import (
     PAIRING_SLACK,
     NET_VARIANCE_MAX,
 )
+
+
+def _effective_players(players, match):
+    """
+    Players with skill `group` overridden by the match day's k-means cluster assignment.
+
+    Clusters are computed once when squads are generated (see below) and stored on the
+    match as {pid: group}. Everything downstream — generate_squads, squad_order, the
+    pairing engine — reads players[pid]["group"] unchanged; it just sees the clustered
+    group instead of the static roster group. Players not in the assignment (shouldn't
+    happen for present players) keep their roster group.
+    """
+    groups = (match or {}).get("groups")
+    if not groups:
+        return players
+    return {
+        pid: ({**p, "group": groups[pid]} if pid in groups else p)
+        for pid, p in players.items()
+    }
 
 
 def page_match_day():
@@ -33,7 +53,7 @@ def page_match_day():
             set_match(None)
             st.rerun()
         st.divider()
-        _match_in_progress(data, match, players)
+        _match_in_progress(data, match, _effective_players(players, match))
         return
 
     # ── New match day setup ──
@@ -127,10 +147,25 @@ def page_match_day():
         ),
     )
 
+    # Preview which skill groups clustering will assign for this turnout.
+    mode = get_clustering_mode()
+    stats = compute_stats(data)
+    preview = clustering.compute_clusters(mode, present, players, stats)
+    mode_label = ("Rating-Based (Glicko-2)" if mode == clustering.MODE_RATING
+                  else "Performance-Based (win rate + games)")
+    st.caption(f"Skill groups will be set by **{mode_label}** k-means clustering "
+               f"(change on the 🏠 Home page). {preview['k']} groups from {len(present)} players.")
+    if preview["n_flagged"]:
+        flag_word = "unrated" if mode == clustering.MODE_RATING else "insufficient data"
+        st.caption(f"⚠️ {preview['n_flagged']} player(s) with {flag_word} → defaulted to "
+                   f"Group {preview['median_group']}.")
+
     if st.button("🏆 Generate Squads →", type="primary"):
-        squad_a, squad_b = generate_squads(present, players)
+        groups = preview["groups"]
+        eff_players = _effective_players(players, {"groups": groups})
+        squad_a, squad_b = generate_squads(present, eff_players)
         if enforce_gender and len(women_present) >= 2:
-            squad_a, squad_b = _enforce_gender_balance(squad_a, squad_b, players)
+            squad_a, squad_b = _enforce_gender_balance(squad_a, squad_b, eff_players)
         set_match(
             {
                 "id": str(uuid.uuid4())[:8],
@@ -142,6 +177,17 @@ def page_match_day():
                 "squad_wins": {"a": 0, "b": 0},
                 "completed": False,
                 "step": "squads",
+                # k-means output, computed once here and reused for the whole match day.
+                "groups": groups,
+                "clustering": {
+                    "mode": preview["mode"],
+                    "k": preview["k"],
+                    "n_flagged": preview["n_flagged"],
+                    "median_group": preview["median_group"],
+                    "flagged": preview["flagged"],
+                    "centroids": preview["centroids"],
+                    "values": preview["values"],
+                },
             }
         )
         st.rerun()
@@ -190,6 +236,14 @@ def _step_squads(match, players):
         "Swap players between squads if needed. Pairings are built automatically — "
         "no manual ranking. The order used is shown below."
     )
+    meta = match.get("clustering")
+    if meta:
+        mode_label = ("Rating-Based" if meta["mode"] == clustering.MODE_RATING
+                      else "Performance-Based")
+        flagged_note = (f" · {meta['n_flagged']} defaulted to Group {meta['median_group']}"
+                        if meta.get("n_flagged") else "")
+        st.caption(f"🧮 Groups set by **{mode_label}** k-means "
+                   f"({meta['k']} clusters){flagged_note}. Locked for this match day.")
 
     def pid_label(pid):
         p = players[pid]

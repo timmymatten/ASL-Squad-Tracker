@@ -12,6 +12,28 @@ and within each game players pair up to play head-to-head **nets**.
 
 ## Features
 
+### 🏠 Home — k-means skill grouping
+Skill groups (1–4) are built automatically by **k-means clustering** (`scikit-learn`,
+`KMeans(n_clusters=4)`) instead of manual assignment, in one of two modes (toggle persists
+with the dataset and holds across the match day):
+
+- **Rating-Based** (default) — clusters players on their live **NATS Glicko-2 rating**,
+  read straight from the [`nats-rankings-monitor`](https://github.com/timmymatten/nats-rankings-monitor)
+  project's `snapshot.json` schema (`core/ratings.py` matches roster names to the rankings
+  page). Players with no rating on record are defaulted to the median cluster and flagged
+  **"unrated"**.
+- **Performance-Based** — clusters on this app's own **(win_rate, games_played)**,
+  standardized (`StandardScaler`) so the two scales weigh equally. Players with 0 games are
+  defaulted to the median cluster and flagged **"insufficient data"**.
+
+Clusters are relabelled by centroid so **Group 1 is always the strongest**, keeping numbering
+stable match to match. A **Plotly** chart on the Home page visualizes the current grouping
+(rating strip plot with centroid lines, or win-rate-vs-games scatter with centroid markers),
+and a banner reports how many players have enough game history to consider switching modes.
+Clusters are computed **once at the start of each match day** and stored on the match record
+(auditable in history); their output feeds the existing squad/pairing logic unchanged.
+
+
 ### 📋 Roster
 Add, edit, activate/deactivate, and remove players. Each player has a **skill group**
 (1–4) and gender. Only active players appear on match days.
@@ -73,9 +95,12 @@ delete-with-confirmation.
 
 ## Data & persistence
 
-State is a single JSON document per dataset: `{ "players": {…}, "match_days": [...] }`.
-All stats are **derived on each render** by replaying match history — nothing is
-denormalized or cached on disk.
+State is a single JSON document per dataset:
+`{ "players": {…}, "match_days": [...], "config": {…} }`. All stats are **derived on each
+render** by replaying match history — nothing is denormalized or cached on disk. `config`
+holds the selected clustering mode; each completed match day also stores the `groups`
+(pid → cluster group) and `clustering` metadata (mode, centroids, flagged players) used that
+day, so past grouping decisions are auditable.
 
 Two independent datasets, switchable from the sidebar (they never mix):
 - **🟢 Real** — your live data.
@@ -99,15 +124,17 @@ See **[docs/DEPLOY.md](docs/DEPLOY.md)** for the full Supabase + Streamlit Commu
 ```
 app.py                 # entry point: page config, sidebar nav, dataset switch
 core/
-  constants.py         # group labels/colors, dataset file names
+  constants.py         # group labels/colors/palette, dataset file names
   storage.py           # Supabase-or-local backend (read/write_dataset)
-  persistence.py       # session-cached get_data / persist / dataset switching
+  persistence.py       # session-cached get_data / persist / dataset + clustering-mode config
   match_state.py       # in-progress match (session state)
   algorithms.py        # squad generation, pairing, sitter rotation, selection
   stats.py             # compute_stats, squad_order, partnerships, head-to-head, promotions
+  ratings.py           # NATS Glicko-2 ratings from nats-rankings-monitor's snapshot.json
+  clustering.py        # k-means skill grouping (rating / performance modes)
   sample_data.py       # synthetic match-day generator
 views/
-  roster.py  match_day.py  leaderboard.py  chemistry.py  player.py  history.py
+  home.py  roster.py  match_day.py  leaderboard.py  chemistry.py  player.py  history.py
 scripts/
   seed_sample_data.py    # CLI: (re)generate the sample dataset
   migrate_to_supabase.py # CLI: push local JSON into Supabase
