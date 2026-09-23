@@ -46,24 +46,32 @@ Add, edit, activate/deactivate, and remove players. Each player has a **skill gr
 | 4 | Rookies |
 
 ### 🎯 Match Day
-Runs an entire session end to end:
-1. **Check in** present players. Capped at **16**; if more show up, spots are allocated
-   per skill group favoring players with the **fewest match days attended** (fair rotation).
-2. **Generate squads** — players are split into two skill-balanced squads (optionally
-   enforcing **≥ 1 woman per squad**). You can hand-swap players between squads.
-3. **Pairings** per game, **auto** or **manual**:
-   - Pairs balance a stronger player with a developing one; opposing nets are matched to
-     be even (a net-variance rule flags lopsided matchups).
-   - The same pair can't repeat from the previous game; **sitters** rotate so nobody sits
-     more than twice in a row when squads are odd.
-   - **🔄 Regenerate** cycles through alternative balanced matchups.
-4. **Enter scores** per net (games to 21). The winner is the higher score; **point
+Match days use a fixed squad format: **two squads of 10, each 7 open + 3 women**, playing
+**5 nets per game** (no sitters). Runs an entire session end to end:
+1. **Check in** present players. Needs **14 open + 6 women** (players with no gender set
+   count as open). If more show up, each pool is capped separately, with spots allocated
+   per skill group to players with the **fewest match days attended** (fair rotation).
+2. **Generate squads**: the open pool and the women's pool are each split skill-balanced,
+   so every squad gets exactly 7 + 3. Hand-swaps are one-for-one within a pool.
+3. **Rank**: within each squad, open players are ranked **O1–O7** and women **W1–W3**
+   (by skill group, then **average point differential per game**; newcomers with fewer
+   than 5 games sit neutral). A pair's **score** is the sum of its two ranks.
+4. **Coin flip**: an animated coin toss picks the squad that **sets** Game 1. Setting then
+   alternates each game.
+5. **Setting team sets the lineup**: it picks a shape and fills all five nets:
+   - **2 Open + 3 Coed**, or
+   - **3 Open + 1 Women's + 1 Coed**
+
+   A balanced lineup is pre-filled as a starting point ("Suggest another" cycles options).
+6. **Opposing team matches**: it fields a pair of the same type on every net, and each
+   matchup must be within **±3** on pair score. The most even legal matchup is pre-filled;
+   **🔄 Next legal matchup** cycles alternatives, and manual edits are checked live. (If no
+   lineup can satisfy ±3 on every net, the closest is shown and the game may still start.)
+7. **Enter scores** per net (games to 21). The winner is the higher score; **point
    differential** is recorded.
 
-**Within-squad ordering is transparent and automatic** (no manual 1–8 ranking): players
-are ordered by **skill group**, then by **average point differential per game** (the same
-+/− shown on the Leaderboard, ÷ games). Newcomers with fewer than 5 games sit neutral
-until they've played enough. The order used is shown right on the squad screen.
+Each saved game records the setting squad, shape, net types and the ranks used, so History
+shows exactly how every game was set.
 
 ### 🏆 Leaderboard
 Per-player **Wins, Games, Win %, Points For / Against / Differential, Attendance, Upsets**,
@@ -106,7 +114,9 @@ Two independent datasets, switchable from the sidebar (they never mix):
 - **🟢 Real** — your live data.
 - **🧪 Sample** — throwaway test data (50 synthetic match days) you can regenerate
   anytime via the sidebar button or `python scripts/seed_sample_data.py`. Synthetic match days are
-  produced by replaying the *real* matchmaking pipeline, so every one is realistic.
+  produced by replaying the *real* matchmaking pipeline, so every one is realistic. If the
+  real roster is short of 14+ open or 6+ women, the sample roster is padded with clearly
+  named synthetic players ("Sample Woman 1", …). The real roster is never modified.
 
 **Storage backend** (`core/storage.py`) is pluggable:
 - If `SUPABASE_URL` / `SUPABASE_KEY` are set (env vars **or** `.streamlit/secrets.toml`),
@@ -128,7 +138,8 @@ core/
   storage.py           # Supabase-or-local backend (read/write_dataset)
   persistence.py       # session-cached get_data / persist / dataset + clustering-mode config
   match_state.py       # in-progress match (session state)
-  algorithms.py        # squad generation, pairing, sitter rotation, selection
+  algorithms.py        # squad generation and attendance-fair selection
+  lineups.py           # 7+3 format: ranks, lineup shapes, setting/matching, ±3 rule
   stats.py             # compute_stats, squad_order, partnerships, head-to-head, promotions
   ratings.py           # NATS Glicko-2 ratings from nats-rankings-monitor's snapshot.json
   clustering.py        # k-means skill grouping (rating / performance modes)
@@ -165,9 +176,9 @@ season of data, switch to **🧪 Sample** in the sidebar (or run `python scripts
 ## Configuration knobs
 
 Tunable constants (no code restructure needed):
-- `core/algorithms.py` — `PAIRING_SLACK` (matchup variety), `NET_VARIANCE_MAX` (how even
-  opposing nets must be).
-- `core/stats.py` — `MIN_ORDER_GAMES` (games before point-diff affects pairing order),
+- `core/lineups.py`: `MATCH_TOLERANCE` (±3 matchup rule), `SHAPES` (lineup shapes),
+  `OPEN_PER_SQUAD` / `WOMEN_PER_SQUAD`, `SUGGEST_SLACK` (variety of suggested lineups).
+- `core/stats.py` — `MIN_ORDER_GAMES` (games before point-diff affects ranking),
   `MIN_PARTNER_GAMES` (chemistry/head-to-head qualification), and the promotion thresholds
   `MIN_GAMES` / `PROMOTE_THRESHOLD` / `STRONG_THRESHOLD`.
 

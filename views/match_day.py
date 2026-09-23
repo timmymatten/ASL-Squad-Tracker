@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import uuid
 import random
 from datetime import date
@@ -6,19 +7,37 @@ from datetime import date
 from core.constants import GROUP_LABELS, GROUP_COLORS
 from core.persistence import get_data, persist, get_clustering_mode
 from core.match_state import get_match, set_match
-from core.stats import compute_stats, squad_order, order_strength, MIN_ORDER_GAMES
+from core.stats import compute_stats, order_strength, MIN_ORDER_GAMES
 from core import clustering
 from core.algorithms import (
-    generate_squads,
-    _enforce_gender_balance,
-    find_best_pairing,
-    sort_pairs_by_score,
-    pick_sitter,
+    generate_format_squads,
     player_attendance,
-    select_players_for_session,
-    PAIRING_SLACK,
-    NET_VARIANCE_MAX,
+    select_players_for_format,
 )
+from core.lineups import (
+    OPEN_PER_SQUAD,
+    WOMEN_PER_SQUAD,
+    N_NETS,
+    MATCH_TOLERANCE,
+    SHAPES,
+    NET_LABELS,
+    NET_ICONS,
+    NET_SLOTS,
+    split_pools,
+    squad_ranks,
+    rank_label,
+    pair_score,
+    net_gaps,
+    setting_side,
+    composition_errors,
+    lineup_errors,
+    suggest_setting_lineup,
+    matching_candidates,
+    is_legal,
+)
+
+SQUAD_NAME = {"a": "🔵 Squad A", "b": "🔴 Squad B"}
+EMPTY = "—"
 
 
 def _effective_players(players, match):
@@ -26,10 +45,9 @@ def _effective_players(players, match):
     Players with skill `group` overridden by the match day's k-means cluster assignment.
 
     Clusters are computed once when squads are generated (see below) and stored on the
-    match as {pid: group}. Everything downstream — generate_squads, squad_order, the
-    pairing engine — reads players[pid]["group"] unchanged; it just sees the clustered
-    group instead of the static roster group. Players not in the assignment (shouldn't
-    happen for present players) keep their roster group.
+    match as {pid: group}. Everything downstream — squad generation, ranking, lineups —
+    reads players[pid]["group"] unchanged; it just sees the clustered group instead of
+    the static roster group. Players not in the assignment keep their roster group.
     """
     groups = (match or {}).get("groups")
     if not groups:
@@ -58,10 +76,9 @@ def page_match_day():
 
     # ── New match day setup ──
     st.subheader("Start a New Match Day")
+    st.caption(f"Format: two squads of **{OPEN_PER_SQUAD} open + {WOMEN_PER_SQUAD} women**, "
+               f"{N_NETS} nets per game.")
     active = [(pid, p) for pid, p in players.items() if p["active"]]
-    if len(active) < 4:
-        st.warning("Add at least 4 active players on the Roster page first.")
-        return
 
     match_date = st.date_input("Match date", value=date.today())
     st.write("**Select present players:**")
@@ -81,71 +98,52 @@ def page_match_day():
                 if st.checkbox(p["name"], value=True, key=f"pres_{pid}"):
                     present.append(pid)
 
-    if len(present) < 4:
-        st.warning("Select at least 4 players.")
+    need_open, need_women = 2 * OPEN_PER_SQUAD, 2 * WOMEN_PER_SQUAD
+    open_in, women_in = split_pools(present, players)
+    st.caption(f"Checked in: **{len(open_in)}/{need_open} open** · "
+               f"**{len(women_in)}/{need_women} women** "
+               "(players without a gender set count as open).")
+    short = []
+    if len(open_in) < need_open:
+        short.append(f"{need_open - len(open_in)} more open player(s)")
+    if len(women_in) < need_women:
+        short.append(f"{need_women - len(women_in)} more woman/women")
+    if short:
+        st.warning(f"Need {' and '.join(short)} to fill two squads of "
+                   f"{OPEN_PER_SQUAD} open + {WOMEN_PER_SQUAD} women.")
         return
 
-    MAX_PLAYERS = 16
     attend = player_attendance(data["match_days"])
 
-    if len(present) > MAX_PLAYERS:
-        playing, benched = select_players_for_session(
-            present, players, data["match_days"], MAX_PLAYERS
-        )
+    if len(open_in) > need_open or len(women_in) > need_women:
+        playing, benched = select_players_for_format(present, players, data["match_days"])
         st.divider()
         st.warning(
-            f"**{len(present)} players checked in — capped at {MAX_PLAYERS}.** "
-            f"Players were selected within each skill group by fewest match days attended."
+            f"**{len(present)} players checked in — capped at {need_open} open + "
+            f"{need_women} women.** Players were selected within each pool and skill group "
+            "by fewest match days attended."
         )
 
-        # Show who's in vs. benched, grouped
         c_in, c_out = st.columns(2)
-        with c_in:
-            st.markdown(f"**✅ Playing today ({len(playing)})**")
-            for g in [1, 2, 3, 4]:
-                pids = sorted(
-                    [p for p in playing if players[p]["group"] == g],
-                    key=lambda p: (attend.get(p, 0), players[p]["name"]),
-                )
-                for pid in pids:
-                    days = attend.get(pid, 0)
-                    st.write(f"{GROUP_COLORS[g]} {players[pid]['name']} — {days} days")
-        with c_out:
-            st.markdown(f"**🪑 Sitting out ({len(benched)})**")
-            for g in [1, 2, 3, 4]:
-                pids = sorted(
-                    [p for p in benched if players[p]["group"] == g],
-                    key=lambda p: (attend.get(p, 0), players[p]["name"]),
-                )
-                for pid in pids:
-                    days = attend.get(pid, 0)
-                    st.write(f"{GROUP_COLORS[g]} {players[pid]['name']} — {days} days")
-
+        for col, pids_all, title in (
+            (c_in, playing, f"**✅ Playing today ({len(playing)})**"),
+            (c_out, benched, f"**🪑 Sitting out ({len(benched)})**"),
+        ):
+            with col:
+                st.markdown(title)
+                for g in [1, 2, 3, 4]:
+                    pids = sorted(
+                        [p for p in pids_all if players[p]["group"] == g],
+                        key=lambda p: (attend.get(p, 0), players[p]["name"]),
+                    )
+                    for pid in pids:
+                        tag = " ♀" if pid in women_in else ""
+                        st.write(f"{GROUP_COLORS[g]} {players[pid]['name']}{tag} — "
+                                 f"{attend.get(pid, 0)} days")
         present = playing
-    else:
-        benched = []
 
-    n = len(present)
-    if n % 2 != 0:
-        st.warning(
-            f"⚠️ {n} players (odd). One squad will have an extra player — "
-            "an upset is possible and will be tracked."
-        )
-    else:
-        st.success(f"**{n} players** → {n//2} per squad, {n//4} nets per game")
-
-    women_present = [p for p in present if players[p].get("gender") == "F"]
-    enforce_gender = st.checkbox(
-        "Require ≥ 1 woman per squad",
-        value=False,
-        disabled=len(women_present) < 2,
-        help=(
-            "Ensures each squad has at least one woman. "
-            "Requires ≥ 2 women checked in."
-            if len(women_present) >= 2
-            else f"Only {len(women_present)} woman checked in — need at least 2."
-        ),
-    )
+    st.success(f"**{len(present)} players** → 2 squads of {OPEN_PER_SQUAD} open + "
+               f"{WOMEN_PER_SQUAD} women, {N_NETS} nets per game")
 
     # Preview which skill groups clustering will assign for this turnout.
     mode = get_clustering_mode()
@@ -163,9 +161,7 @@ def page_match_day():
     if st.button("🏆 Generate Squads →", type="primary"):
         groups = preview["groups"]
         eff_players = _effective_players(players, {"groups": groups})
-        squad_a, squad_b = generate_squads(present, eff_players)
-        if enforce_gender and len(women_present) >= 2:
-            squad_a, squad_b = _enforce_gender_balance(squad_a, squad_b, eff_players)
+        squad_a, squad_b = generate_format_squads(present, eff_players)
         set_match(
             {
                 "id": str(uuid.uuid4())[:8],
@@ -177,6 +173,8 @@ def page_match_day():
                 "squad_wins": {"a": 0, "b": 0},
                 "completed": False,
                 "step": "squads",
+                # Coin flip: which squad sets the Game 1 lineup (then it alternates).
+                "setting_first": random.choice(["a", "b"]),
                 # k-means output, computed once here and reused for the whole match day.
                 "groups": groups,
                 "clustering": {
@@ -193,48 +191,75 @@ def page_match_day():
         st.rerun()
 
 
-def _squad_display(squad_ids, players, label, color):
-    st.markdown(f"**{color} {label}** ({len(squad_ids)} players)")
-    for pid in sorted(squad_ids, key=lambda p: (players[p]["group"], players[p]["name"])):
-        p = players[pid]
-        st.write(f"{GROUP_COLORS[p['group']]} {p['name']} — G{p['group']}")
+def _ranks(match, players):
+    """{pid: rank} per squad — open O1..O7, women W1..W3 (stats are fixed for the day)."""
+    stats = compute_stats(get_data())
+    return (squad_ranks(match["squad_a"], stats, players),
+            squad_ranks(match["squad_b"], stats, players))
+
+
+def _pname(pid, players, ranks):
+    return f"{players[pid]['name']} ({rank_label(pid, ranks, players)})"
+
+
+def _squad_display(squad_ids, players, ranks, label):
+    st.markdown(f"**{label}** ({len(squad_ids)} players)")
+    open_ids, women_ids = split_pools(squad_ids, players)
+    for pool in (open_ids, women_ids):
+        for pid in sorted(pool, key=lambda p: ranks[p]):
+            p = players[pid]
+            st.write(f"`{rank_label(pid, ranks, players)}` {GROUP_COLORS[p['group']]} "
+                     f"{p['name']} — G{p['group']}")
 
 
 def _match_in_progress(data, match, players):
-    squad_a = match["squad_a"]
-    squad_b = match["squad_b"]
-
-    # Sidebar squad overview
-    c_a, c_b = st.columns(2)
-    with c_a:
-        _squad_display(squad_a, players, "Squad A", "🔵")
-    with c_b:
-        _squad_display(squad_b, players, "Squad B", "🔴")
-
+    ranks_a, ranks_b = _ranks(match, players)
     step = match.get("step", "squads")
-    st.divider()
+
+    if step == "flip":
+        _step_flip(match)  # first thing on screen, so nobody scrolls past the animation
+        st.divider()
+
+    def squads():
+        c_a, c_b = st.columns(2)
+        with c_a:
+            _squad_display(match["squad_a"], players, ranks_a, SQUAD_NAME["a"])
+        with c_b:
+            _squad_display(match["squad_b"], players, ranks_b, SQUAD_NAME["b"])
+
+    if step in ("squads", "flip"):
+        squads()
+        st.divider()
+    else:
+        with st.expander("👥 Squads & ranks"):
+            squads()
 
     if step == "squads":
         _step_squads(match, players)
-    elif step == "pairing":
-        _step_pairing(match, players)
+    elif step == "lineup":
+        _step_setting_lineup(match, players, ranks_a, ranks_b)
+    elif step == "matching":
+        _step_matching(match, players, ranks_a, ranks_b)
     elif step == "results":
-        _step_results(data, match, players)
+        _step_results(data, match, players, ranks_a, ranks_b)
     elif step == "done":
         st.success("✅ Match day complete — results saved!")
         set_match(None)
         st.rerun()
 
 
+# ─── Step: adjust squads ──────────────────────────────────────────────────────
+
+
 def _step_squads(match, players):
     squad_a = match["squad_a"]
     squad_b = match["squad_b"]
 
-    # ── Swap players ──────────────────────────────────────────────────────────
     st.subheader("Adjust Squads")
     st.caption(
-        "Swap players between squads if needed. Pairings are built automatically — "
-        "no manual ranking. The order used is shown below."
+        f"Each squad needs exactly {OPEN_PER_SQUAD} open + {WOMEN_PER_SQUAD} women, so swaps "
+        "are one-for-one within the same pool (open ↔ open, woman ↔ woman). Ranks update "
+        "automatically."
     )
     meta = match.get("clustering")
     if meta:
@@ -247,390 +272,373 @@ def _step_squads(match, players):
 
     def pid_label(pid):
         p = players[pid]
-        return f"{p['name']} (G{p['group']})"
+        return f"{p['name']} (G{p['group']}{', ♀' if p.get('gender') == 'F' else ''})"
 
     c1, c2 = st.columns(2)
     with c1:
-        move_from_a = st.selectbox(
-            "Move from A → B",
-            ["—"] + squad_a,
-            format_func=lambda x: "—" if x == "—" else pid_label(x),
-            key="mv_a",
-        )
+        swap_a = st.selectbox("From Squad A", [EMPTY] + squad_a,
+                              format_func=lambda x: x if x == EMPTY else pid_label(x), key="mv_a")
     with c2:
-        move_from_b = st.selectbox(
-            "Move from B → A",
-            ["—"] + squad_b,
-            format_func=lambda x: "—" if x == "—" else pid_label(x),
-            key="mv_b",
-        )
+        swap_b = st.selectbox("From Squad B", [EMPTY] + squad_b,
+                              format_func=lambda x: x if x == EMPTY else pid_label(x), key="mv_b")
 
-    if st.button("↔️ Apply Swap"):
-        pa = move_from_a if move_from_a != "—" else None
-        pb = move_from_b if move_from_b != "—" else None
-        if pa and pb:
-            squad_a.remove(pa); squad_b.remove(pb)
-            squad_a.append(pb); squad_b.append(pa)
-        elif pa:
-            squad_a.remove(pa); squad_b.append(pa)
-        elif pb:
-            squad_b.remove(pb); squad_a.append(pb)
-        match["squad_a"] = squad_a
-        match["squad_b"] = squad_b
-        set_match(match)
-        st.rerun()
+    if st.button("↔️ Swap"):
+        if swap_a == EMPTY or swap_b == EMPTY:
+            st.error("Pick one player from each squad to swap.")
+        elif (players[swap_a].get("gender") == "F") != (players[swap_b].get("gender") == "F"):
+            st.error("Swap open with open or woman with woman so both squads stay 7 + 3.")
+        else:
+            squad_a[squad_a.index(swap_a)] = swap_b
+            squad_b[squad_b.index(swap_b)] = swap_a
+            set_match(match)
+            st.rerun()
 
-    # ── Pairing order (transparent) ────────────────────────────────────────────
     st.divider()
     st.caption(
-        "**Pairing order:** by skill group, then by **average point differential per "
-        f"game** (Leaderboard +/− ÷ games). Players with under {MIN_ORDER_GAMES} games "
-        "sit in the middle until they've played enough. Pairs put a stronger player with "
-        "a developing one, and nets are matched evenly."
+        "**Ranking:** open players and women are ranked separately within each squad — "
+        "by skill group, then by **average point differential per game** (Leaderboard +/− "
+        f"÷ games). Players with under {MIN_ORDER_GAMES} games sit in the middle of their "
+        "group until they've played enough. A pair's score is the sum of its two ranks; "
+        f"opposing pairs must be within ±{MATCH_TOLERANCE}."
     )
     stats = compute_stats(get_data())
-    col_a, col_b = st.columns(2)
-    for col, squad, label, color in (
-        (col_a, squad_a, "Squad A", "🔵"),
-        (col_b, squad_b, "Squad B", "🔴"),
-    ):
-        with col:
-            st.markdown(f"**{color} {label}**")
-            for pid in squad_order(squad, stats, players):
-                p = players[pid]
-                g = stats[pid]["games"]
-                metric = f"{order_strength(pid, stats):+.1f}/game" if g >= MIN_ORDER_GAMES \
-                    else f"new ({g} g)"
-                st.write(f"{GROUP_COLORS[p['group']]} {p['name']} — G{p['group']} · {metric}")
+    with st.expander("Ranking detail"):
+        col_a, col_b = st.columns(2)
+        for col, squad, side in ((col_a, squad_a, "a"), (col_b, squad_b, "b")):
+            ranks = squad_ranks(squad, stats, players)
+            with col:
+                st.markdown(f"**{SQUAD_NAME[side]}**")
+                for pid in sorted(squad, key=lambda p: (players[p].get("gender") == "F", ranks[p])):
+                    g = stats[pid]["games"]
+                    metric = (f"{order_strength(pid, stats):+.1f}/game" if g >= MIN_ORDER_GAMES
+                              else f"new ({g} g)")
+                    st.write(f"`{rank_label(pid, ranks, players)}` {players[pid]['name']} · {metric}")
 
     st.divider()
-    if st.button("✅ Confirm Squads — Begin Match!", type="primary"):
-        match["step"] = "pairing"
+    problems = [f"{SQUAD_NAME[s]} {e}" for s in ("a", "b")
+                for e in composition_errors(match[f"squad_{s}"], players)]
+    for p in problems:
+        st.error(p)
+    if st.button("✅ Confirm Squads — Flip for Setting Team!", type="primary",
+                 disabled=bool(problems)):
+        match["step"] = "flip"
         set_match(match)
         st.rerun()
 
 
-def _pairing_context(match, players, seed=0):
-    """
-    Compute shared context needed by both auto and manual pairing modes.
-
-    seed makes sitter selection reproducible for a given render so the displayed setup
-    is exactly what gets committed; bumping it (via Regenerate) reshuffles the sitter.
-    """
-    squad_a = match["squad_a"]
-    squad_b = match["squad_b"]
-    games = match["games"]
-
-    forbidden_a, forbidden_b = set(), set()
-    if games:
-        last = games[-1]
-        for pair in last.get("pairings_a", []):
-            forbidden_a.add(frozenset(pair))
-        for pair in last.get("pairings_b", []):
-            forbidden_b.add(frozenset(pair))
-
-    sit_hist_a = [g["sit_a"] for g in games if g.get("sit_a")]
-    sit_hist_b = [g["sit_b"] for g in games if g.get("sit_b")]
-
-    active_a = list(squad_a)
-    active_b = list(squad_b)
-    sit_a = sit_b = None
-
-    rng = random.Random(seed)
-    if len(active_a) % 2:
-        sit_a = pick_sitter(active_a, sit_hist_a, rng=rng)
-        active_a = [p for p in active_a if p != sit_a]
-    if len(active_b) % 2:
-        sit_b = pick_sitter(active_b, sit_hist_b, rng=rng)
-        active_b = [p for p in active_b if p != sit_b]
-
-    # Transparent within-squad strength: order each squad by skill group, then by raw
-    # point differential (the +/- on the Leaderboard), and turn that order into 1..n
-    # rank weights. No hidden rating — the basis is fully explainable to players.
-    stats = compute_stats(get_data())
-    ranks_a = {pid: i + 1 for i, pid in enumerate(squad_order(squad_a, stats, players))}
-    ranks_b = {pid: i + 1 for i, pid in enumerate(squad_order(squad_b, stats, players))}
-
-    return active_a, active_b, sit_a, sit_b, ranks_a, ranks_b, forbidden_a, forbidden_b
+# ─── Step: coin flip for the setting team ────────────────────────────────────
 
 
-def _net_gap(pairs_a, pairs_b, ranks_a, ranks_b, i):
-    """Absolute gap between the two pairs' combined ratings on net i."""
-    sa = ranks_a[pairs_a[i][0]] + ranks_a[pairs_a[i][1]]
-    sb = ranks_b[pairs_b[i][0]] + ranks_b[pairs_b[i][1]]
-    return abs(sa - sb)
+FLIP_HTML = """
+<style>
+  :root { --a: #2a78d6; --b: #d64545; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         display: flex; flex-direction: column; align-items: center; }
+  .caption { color: #888; font-size: 13px; letter-spacing: .08em; text-transform: uppercase;
+             margin: 6px 0 0; }
+  .stage { height: 270px; width: 100%; display: flex; align-items: flex-end;
+           justify-content: center; perspective: 900px; position: relative; }
+  .toss { margin-bottom: 26px; }
+  .coin { width: 128px; height: 128px; position: relative; transform-style: preserve-3d; }
+  .face { position: absolute; inset: 0; border-radius: 50%; backface-visibility: hidden;
+          display: flex; flex-direction: column; align-items: center; justify-content: center;
+          color: #fff; box-shadow: inset 0 0 0 6px rgba(255,255,255,.35), inset 0 -10px 18px rgba(0,0,0,.25); }
+  .face b { font-size: 56px; line-height: 1; }
+  .face small { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; opacity: .9; margin-top: 4px; }
+  .fa { background: radial-gradient(circle at 35% 30%, #5c9ce6, var(--a) 70%); }
+  .fb { background: radial-gradient(circle at 35% 30%, #e87878, var(--b) 70%); transform: rotateX(180deg); }
+  .shadow { position: absolute; bottom: 12px; width: 110px; height: 14px; border-radius: 50%;
+            background: rgba(0,0,0,.18); filter: blur(3px); }
+  .play .toss   { animation: toss 2.6s cubic-bezier(.3,.0,.4,1) forwards; }
+  .play .coin   { animation: spin 2.6s cubic-bezier(.15,.55,.25,1) forwards; }
+  .play .shadow { animation: shadow 2.6s cubic-bezier(.3,.0,.4,1) forwards; }
+  @keyframes toss { 0% { transform: translateY(0); } 45% { transform: translateY(-105px); }
+                    80% { transform: translateY(0); } 88% { transform: translateY(-12px); }
+                    100% { transform: translateY(0); } }
+  @keyframes spin { from { transform: rotateX(0); } to { transform: rotateX(__DEG__deg); } }
+  @keyframes shadow { 0%,100% { transform: scale(1); opacity: 1; } 45% { transform: scale(.55); opacity: .45; } }
+  .result { margin-top: 4px; padding: 10px 22px; border-radius: 999px; color: #fff; font-weight: 700;
+            font-size: 20px; background: var(--__SIDE__); opacity: 0; transform: translateY(8px) scale(.96); }
+  .sub { color: #888; font-size: 13px; margin-top: 8px; opacity: 0; }
+  .play .result { animation: reveal .45s 2.65s ease-out forwards; }
+  .play .sub    { animation: reveal .45s 2.9s ease-out forwards; }
+  @keyframes reveal { to { opacity: 1; transform: none; } }
+  button { margin-top: 12px; background: none; border: 1px solid #8884; color: #888; border-radius: 6px;
+           padding: 4px 12px; font-size: 12px; cursor: pointer; }
+  @media (prefers-reduced-motion: reduce) {
+    .play .toss, .play .coin, .play .shadow { animation-duration: 1ms; }
+    .play .result, .play .sub { animation-delay: 0s; }
+  }
+</style>
+<div id="root" class="play">
+  <p class="caption">Who sets the first lineup?</p>
+  <div class="stage">
+    <div class="toss"><div class="coin">
+      <div class="face fa"><b>A</b><small>Squad A</small></div>
+      <div class="face fb"><b>B</b><small>Squad B</small></div>
+    </div></div>
+    <div class="shadow"></div>
+  </div>
+  <div class="result" style="text-align:center">__NAME__ sets first!</div>
+  <div class="sub">Setting alternates each game</div>
+  <button onclick="var r=document.getElementById('root');r.classList.remove('play');void r.offsetWidth;r.classList.add('play');">↻ Replay</button>
+</div>
+"""
 
 
-def _check_pairing_rules(pairs_a, pairs_b, ranks_a, ranks_b, forbidden_a, forbidden_b):
-    """
-    Return (violations, max_net_gap).
-    Net variance rule: on each net, the gap between opposing pairs' combined ratings
-    must not exceed NET_VARIANCE_MAX. Pairs must be pre-sorted by score before calling.
-    """
-    violations = []
-    n_nets = min(len(pairs_a), len(pairs_b))
+def _step_flip(match):
+    side = match["setting_first"]
+    # Land on the winning face: whole turns show A, a half turn more shows B.
+    deg = 360 * 6 + (180 if side == "b" else 0)
+    html = (FLIP_HTML.replace("__DEG__", str(deg))
+            .replace("__SIDE__", side)
+            .replace("__NAME__", "🔵 Squad A" if side == "a" else "🔴 Squad B"))
+    components.html(html, height=430)
 
-    # Repeat-pair check
-    for i, pair in enumerate(pairs_a[:n_nets]):
-        if frozenset(pair) in forbidden_a:
-            violations.append(f"🔵 Squad A Net {i+1}: same pair as last game")
-    for i, pair in enumerate(pairs_b[:n_nets]):
-        if frozenset(pair) in forbidden_b:
-            violations.append(f"🔴 Squad B Net {i+1}: same pair as last game")
-
-    # Net variance rule: opposing pairs on the same net must be evenly matched.
-    max_gap = 0.0
-    for i in range(n_nets):
-        gap = _net_gap(pairs_a, pairs_b, ranks_a, ranks_b, i)
-        max_gap = max(max_gap, gap)
-        if gap > NET_VARIANCE_MAX:
-            violations.append(f"Net {i+1}: pairs look mismatched")
-
-    return violations, max_gap
+    st.caption(f"The setting team picks a lineup shape and fills all {N_NETS} nets; the other "
+               f"squad then matches every net within ±{MATCH_TOLERANCE}.")
+    if st.button("▶️ Continue to Game 1", type="primary"):
+        match["step"] = "lineup"
+        set_match(match)
+        st.rerun()
 
 
-def _display_pairing_table(pairs_a, pairs_b, ranks_a, ranks_b, players):
-    """Player-facing matchups. Ratings stay hidden; show only an even/mismatch marker."""
-    n_nets = min(len(pairs_a), len(pairs_b))
-    hdr = st.columns([1, 5, 1, 5])
-    hdr[0].markdown("**Net**")
-    hdr[1].markdown("**🔵 Squad A**")
-    hdr[2].markdown("**Match**")
-    hdr[3].markdown("**🔴 Squad B**")
-    for i in range(n_nets):
-        pa1, pa2 = pairs_a[i]
-        pb1, pb2 = pairs_b[i]
-        marker = "⚠️" if _net_gap(pairs_a, pairs_b, ranks_a, ranks_b, i) > NET_VARIANCE_MAX else "✓"
-        row = st.columns([1, 5, 1, 5])
-        row[0].write(f"**{i+1}**")
-        row[1].write(f"{players[pa1]['name']} & {players[pa2]['name']}")
-        row[2].write(marker)
-        row[3].write(f"{players[pb1]['name']} & {players[pb2]['name']}")
-
-    # Optional net-balance detail (rank-sum per pair; lower = stronger).
-    with st.expander("Net balance details"):
-        st.caption("Each number is the pair's combined rank (lower = stronger). "
-                   "Opposing pairs are matched to keep these close.")
-        for i in range(n_nets):
-            sa = ranks_a[pairs_a[i][0]] + ranks_a[pairs_a[i][1]]
-            sb = ranks_b[pairs_b[i][0]] + ranks_b[pairs_b[i][1]]
-            st.caption(f"Net {i+1}: A {sa} vs B {sb} · gap {abs(sa - sb)}")
+# ─── Step: setting team sets the lineup ──────────────────────────────────────
 
 
-def _step_pairing(match, players):
-    games = match["games"]
-    game_num = len(games) + 1
-    st.subheader(f"Game {game_num} — Pairings")
-
-    # Nonce drives matchup variation. It only changes when Regenerate is pressed, so the
-    # setup stays stable across reruns (e.g. clicking Start Game commits what's shown).
-    # Scoped to this match + game so it resets cleanly for each new game / match day.
-    nonce_key = f"pair_nonce_{match['id']}_{game_num}"
-    nonce = st.session_state.get(nonce_key, 0)
-
-    active_a, active_b, sit_a, sit_b, ranks_a, ranks_b, forbidden_a, forbidden_b = \
-        _pairing_context(match, players, seed=nonce)
-
-    if sit_a:
-        st.info(f"🪑 **Squad A sitting:** {players[sit_a]['name']}")
-    if sit_b:
-        st.info(f"🪑 **Squad B sitting:** {players[sit_b]['name']}")
-
-    tab_auto, tab_manual = st.tabs(["🤖 Auto", "✏️ Manual"])
-
-    # ── Auto tab ──────────────────────────────────────────────────────────────
-    with tab_auto:
-        # nonce 0 → the optimal matchup; each Regenerate rotates to a different
-        # near-optimal one (within PAIRING_SLACK of the best spread).
-        variant = None if nonce == 0 else nonce
-        pairs_a = find_best_pairing(active_a, ranks_a, forbidden_a, variant=variant, slack=PAIRING_SLACK)
-        pairs_b = find_best_pairing(active_b, ranks_b, forbidden_b, variant=variant, slack=PAIRING_SLACK)
-
-        if not pairs_a or not pairs_b:
-            st.error("Could not generate pairings — squad too small?")
-            return
-
-        # Sort by score so rank-1 A pair faces rank-1 B pair, etc.
-        pairs_a = sort_pairs_by_score(pairs_a, ranks_a)
-        pairs_b = sort_pairs_by_score(pairs_b, ranks_b)
-
-        violations, _ = _check_pairing_rules(
-            pairs_a, pairs_b, ranks_a, ranks_b, forbidden_a, forbidden_b
-        )
-        if violations:
-            for v in violations:
-                st.warning(f"⚠️ {v}")
-        else:
-            st.success("✅ Balanced — nets are evenly matched")
-
-        _display_pairing_table(pairs_a, pairs_b, ranks_a, ranks_b, players)
-
-        st.divider()
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("🔄 Regenerate", key="auto_regen"):
-                st.session_state[nonce_key] = nonce + 1
-                st.rerun()
-        with c2:
-            if st.button("▶️ Start Game", type="primary", key="auto_start"):
-                _commit_pairing(match, game_num, pairs_a, pairs_b, sit_a, sit_b)
-
-    # ── Manual tab ────────────────────────────────────────────────────────────
-    with tab_manual:
-        n_nets = min(len(active_a), len(active_b)) // 2
-        st.caption(
-            f"Build {n_nets} pairs per squad. "
-            f"Players are ordered strongest-first (by group, then avg point diff/game). "
-            f"Rules are checked live."
-        )
-
-        def player_options(active, ranks, squad_label):
-            return sorted(active, key=lambda p: ranks[p])
-
-        def pid_label_ranked(pid, ranks):
-            p = players[pid]
-            return f"{p['name']} (G{p['group']})"
-
-        manual_pairs_a = []
-        manual_pairs_b = []
-        used_a: set = set()
-        used_b: set = set()
-        valid = True
-
-        st.markdown("**🔵 Squad A pairs**")
-        opts_a = player_options(active_a, ranks_a, "A")
-        for i in range(n_nets):
-            c1, c2 = st.columns(2)
-            avail_a = [p for p in opts_a if p not in used_a]
-            p1 = c1.selectbox(
-                f"Net {i+1} — Player 1",
-                ["—"] + avail_a,
-                format_func=lambda x: "—" if x == "—" else pid_label_ranked(x, ranks_a),
-                key=f"ma_p1_{i}",
-            )
-            # Second player excludes p1
-            avail_a2 = [p for p in opts_a if p not in used_a and p != p1]
-            p2 = c2.selectbox(
-                f"Net {i+1} — Player 2",
-                ["—"] + avail_a2,
-                format_func=lambda x: "—" if x == "—" else pid_label_ranked(x, ranks_a),
-                key=f"ma_p2_{i}",
-            )
-            if p1 != "—" and p2 != "—":
-                manual_pairs_a.append([p1, p2])
-                used_a.add(p1)
-                used_a.add(p2)
-            else:
-                valid = False
-
-        st.markdown("**🔴 Squad B pairs**")
-        opts_b = player_options(active_b, ranks_b, "B")
-        for i in range(n_nets):
-            c1, c2 = st.columns(2)
-            avail_b = [p for p in opts_b if p not in used_b]
-            p1 = c1.selectbox(
-                f"Net {i+1} — Player 1",
-                ["—"] + avail_b,
-                format_func=lambda x: "—" if x == "—" else pid_label_ranked(x, ranks_b),
-                key=f"mb_p1_{i}",
-            )
-            avail_b2 = [p for p in opts_b if p not in used_b and p != p1]
-            p2 = c2.selectbox(
-                f"Net {i+1} — Player 2",
-                ["—"] + avail_b2,
-                format_func=lambda x: "—" if x == "—" else pid_label_ranked(x, ranks_b),
-                key=f"mb_p2_{i}",
-            )
-            if p1 != "—" and p2 != "—":
-                manual_pairs_b.append([p1, p2])
-                used_b.add(p1)
-                used_b.add(p2)
-            else:
-                valid = False
-
-        # Live rule check — sort by score first so net alignment is meaningful
-        st.divider()
-        if valid and len(manual_pairs_a) == n_nets and len(manual_pairs_b) == n_nets:
-            sorted_a = sort_pairs_by_score(manual_pairs_a, ranks_a)
-            sorted_b = sort_pairs_by_score(manual_pairs_b, ranks_b)
-            violations, _ = _check_pairing_rules(
-                sorted_a, sorted_b,
-                ranks_a, ranks_b,
-                forbidden_a, forbidden_b,
-            )
-            if violations:
-                for v in violations:
-                    st.warning(f"⚠️ {v}")
-                st.error("Fix rule violations before starting the game.")
-            else:
-                st.success("✅ Balanced — nets are evenly matched")
-                _display_pairing_table(sorted_a, sorted_b, ranks_a, ranks_b, players)
-                if st.button("▶️ Start Game", type="primary", key="manual_start"):
-                    _commit_pairing(match, game_num, sorted_a, sorted_b, sit_a, sit_b)
-        else:
-            st.info("Select all pairs above to see rule check.")
+def _seat_options(squad_ids, pool, players, ranks):
+    open_ids, women_ids = split_pools(squad_ids, players)
+    return [EMPTY] + sorted(women_ids if pool == "women" else open_ids, key=lambda p: ranks[p])
 
 
-def _commit_pairing(match, game_num, pairs_a, pairs_b, sit_a, sit_b):
-    n_nets = min(len(pairs_a), len(pairs_b))
-    match["games"].append(
-        {
-            "game_num": game_num,
-            "pairings_a": pairs_a,
-            "pairings_b": pairs_b,
-            "sit_a": sit_a,
-            "sit_b": sit_b,
-            "n_nets": n_nets,
-            "results": None,
-            "game_winner": None,
-        }
+def _fill_seats(prefix, pairs):
+    for i, pair in enumerate(pairs):
+        for seat, pid in enumerate(pair):
+            st.session_state[f"{prefix}_{i}_{seat}"] = pid
+
+
+def _read_seats(prefix, n):
+    def val(k):
+        v = st.session_state.get(k, EMPTY)
+        return None if v == EMPTY else v
+    return [[val(f"{prefix}_{i}_0"), val(f"{prefix}_{i}_1")] for i in range(n)]
+
+
+def _seat_select(col, label, prefix, i, seat, options, players, ranks):
+    col.selectbox(
+        label, options, key=f"{prefix}_{i}_{seat}", label_visibility="collapsed",
+        format_func=lambda x: x if x == EMPTY else _pname(x, players, ranks),
     )
-    match["step"] = "results"
-    set_match(match)
-    st.rerun()
 
 
-def _step_results(data, match, players):
+def _step_setting_lineup(match, players, ranks_a, ranks_b):
+    game_num = len(match["games"]) + 1
+    side = setting_side(match, game_num)
+    other = "b" if side == "a" else "a"
+    squad = match[f"squad_{side}"]
+    ranks = ranks_a if side == "a" else ranks_b
+
+    st.subheader(f"Game {game_num} — {SQUAD_NAME[side]} sets the lineup")
+    st.caption(f"Pick a shape and fill all {N_NETS} nets. {SQUAD_NAME[other]} matches next.")
+
+    shape = st.radio(
+        "Lineup shape", list(SHAPES), horizontal=True,
+        format_func=lambda s: SHAPES[s]["label"], key=f"shape_{match['id']}_{game_num}",
+    )
+    net_types = SHAPES[shape]["nets"]
+    prefix = f"set_{match['id']}_{game_num}_{shape}"
+    nonce_key = f"{prefix}_nonce"
+
+    def autofill(variant):
+        st.session_state[nonce_key] = variant
+        pairs = suggest_setting_lineup(squad, shape, ranks, players, variant=variant)
+        if pairs:
+            _fill_seats(prefix, pairs)
+
+    if nonce_key not in st.session_state:
+        autofill(0)  # start from a balanced suggestion; edit freely below
+
+    st.button("✨ Suggest another balanced lineup",
+              on_click=autofill, args=(st.session_state[nonce_key] + 1,))
+
+    hdr = st.columns([1, 2, 4, 4, 1])
+    for c, h in zip(hdr, ["**Net**", "**Type**", "**Player**", "**Player**", "**Score**"]):
+        c.markdown(h)
+    for i, t in enumerate(net_types):
+        row = st.columns([1, 2, 4, 4, 1])
+        row[0].write(f"**{i+1}**")
+        row[1].write(f"{NET_ICONS[t]} {NET_LABELS[t]}")
+        for seat, pool in enumerate(NET_SLOTS[t]):
+            _seat_select(row[2 + seat], f"Net {i+1} seat {seat+1}", prefix, i, seat,
+                         _seat_options(squad, pool, players, ranks), players, ranks)
+        pair = _read_seats(prefix, len(net_types))[i]
+        row[4].write(str(pair_score(pair, ranks)) if None not in pair else "")
+
+    pairs = _read_seats(prefix, len(net_types))
+    errors = lineup_errors(pairs, net_types, squad, players)
+    st.divider()
+    for e in errors:
+        st.warning(f"⚠️ {e}")
+    if st.button(f"🔒 Lock lineup — {SQUAD_NAME[other]} to match", type="primary",
+                 disabled=bool(errors)):
+        match["pending"] = {"game_num": game_num, "setting": side, "shape": shape,
+                            "net_types": net_types, "setting_pairs": pairs}
+        match["step"] = "matching"
+        set_match(match)
+        st.rerun()
+
+
+# ─── Step: opposing team matches ─────────────────────────────────────────────
+
+
+def _step_matching(match, players, ranks_a, ranks_b):
+    pending = match["pending"]
+    game_num = pending["game_num"]
+    side = pending["setting"]
+    other = "b" if side == "a" else "a"
+    net_types = pending["net_types"]
+    set_pairs = pending["setting_pairs"]
+    ranks_set = ranks_a if side == "a" else ranks_b
+    ranks_mat = ranks_b if side == "a" else ranks_a
+    squad = match[f"squad_{other}"]
+
+    st.subheader(f"Game {game_num} — {SQUAD_NAME[other]} matches")
+    st.caption(f"{SQUAD_NAME[side]} set **{SHAPES[pending['shape']]['label']}**. Field a pair "
+               f"of the same type on every net, within ±{MATCH_TOLERANCE} of the opposing "
+               "pair's score.")
+
+    candidates = matching_candidates(set_pairs, net_types, ranks_set, squad, ranks_mat, players)
+    legal = [c for c in candidates if is_legal(c[1])]
+    cycle = legal or candidates[:1]
+
+    prefix = f"mat_{match['id']}_{game_num}_{pending['shape']}_" + "_".join(
+        "-".join(p) for p in set_pairs)
+    nonce_key = f"{prefix}_nonce"
+
+    def autofill(variant):
+        st.session_state[nonce_key] = variant
+        _fill_seats(prefix, cycle[variant % len(cycle)][0])
+
+    if nonce_key not in st.session_state:
+        autofill(0)  # most even legal matchup
+
+    if legal:
+        st.caption(f"{len(legal)} legal matchup(s) available.")
+        st.button("🔄 Next legal matchup", on_click=autofill,
+                  args=(st.session_state[nonce_key] + 1,))
+    else:
+        st.warning(f"⚠️ No lineup can match every net within ±{MATCH_TOLERANCE}. Showing the "
+                   "closest possible — you may start anyway, or go back and re-set.")
+
+    pairs = _read_seats(prefix, len(net_types))
+    widths = [0.4, 1.1, 2.8, 0.6, 6.6, 0.6, 0.8]
+    hdr = st.columns(widths)
+    for c, h in zip(hdr, ["**#**", "**Type**", f"**{SQUAD_NAME[side]}**", "**Pts**",
+                          f"**{SQUAD_NAME[other]}**", "**Pts**", "**Gap**"]):
+        c.markdown(h)
+    for i, t in enumerate(net_types):
+        sp = set_pairs[i]
+        row = st.columns(widths[:4] + [3.3, 3.3] + widths[5:])
+        row[0].write(f"**{i+1}**")
+        row[1].write(f"{NET_ICONS[t]} {NET_LABELS[t]}")
+        row[2].write(" & ".join(_pname(p, players, ranks_set) for p in sp))
+        row[3].write(str(pair_score(sp, ranks_set)))
+        for seat, pool in enumerate(NET_SLOTS[t]):
+            _seat_select(row[4 + seat], f"Net {i+1} seat {seat+1}", prefix, i, seat,
+                         _seat_options(squad, pool, players, ranks_mat), players, ranks_mat)
+        pairs = _read_seats(prefix, len(net_types))
+        if None not in pairs[i]:
+            ms = pair_score(pairs[i], ranks_mat)
+            gap = abs(ms - pair_score(sp, ranks_set))
+            row[6].write(str(ms))
+            row[7].write(f"{gap} {'✓' if gap <= MATCH_TOLERANCE else '⚠️'}")
+
+    errors = lineup_errors(pairs, net_types, squad, players)
+    st.divider()
+    for e in errors:
+        st.warning(f"⚠️ {e}")
+    blocked = bool(errors)
+    if not errors:
+        gaps = net_gaps(set_pairs, pairs, ranks_set, ranks_mat)
+        bad = [i + 1 for i, g in enumerate(gaps) if g > MATCH_TOLERANCE]
+        if not bad:
+            st.success(f"✅ Every net within ±{MATCH_TOLERANCE}")
+        elif legal:
+            st.error(f"Net(s) {', '.join(map(str, bad))} exceed ±{MATCH_TOLERANCE} — adjust "
+                     "before starting.")
+            blocked = True
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("✏️ Back to setting lineup"):
+            match["step"] = "lineup"
+            set_match(match)
+            st.rerun()
+    with c2:
+        if st.button("▶️ Start Game", type="primary", disabled=blocked):
+            pairs_set, pairs_mat = set_pairs, pairs
+            match["games"].append({
+                "game_num": game_num,
+                "setting": side,
+                "shape": pending["shape"],
+                "net_types": net_types,
+                "pairings_a": pairs_set if side == "a" else pairs_mat,
+                "pairings_b": pairs_mat if side == "a" else pairs_set,
+                "ranks_a": ranks_a,
+                "ranks_b": ranks_b,
+                "sit_a": None,
+                "sit_b": None,
+                "n_nets": len(net_types),
+                "results": None,
+                "game_winner": None,
+            })
+            match.pop("pending", None)
+            match["step"] = "results"
+            set_match(match)
+            st.rerun()
+
+
+# ─── Step: results ───────────────────────────────────────────────────────────
+
+
+def _step_results(data, match, players, ranks_a, ranks_b):
     games = match["games"]
     game = games[-1]
     game_num = game["game_num"]
     n_nets = game["n_nets"]
     pairs_a = game["pairings_a"]
     pairs_b = game["pairings_b"]
+    net_types = game.get("net_types") or [None] * n_nets
 
     st.subheader(f"Game {game_num} — Enter Results")
+    st.caption(f"{SQUAD_NAME[game['setting']]} set **{SHAPES[game['shape']]['label']}**. "
+               "Enter each net's final score — the winner is the higher score.")
 
-    st.caption("Enter each net's final score — the winner is the higher score.")
-
-    hdr = st.columns([1, 4, 2, 2, 4])
-    hdr[0].markdown("**Net**")
-    hdr[1].markdown("**🔵 Squad A**")
-    hdr[2].markdown("**A score**")
-    hdr[3].markdown("**B score**")
-    hdr[4].markdown("**🔴 Squad B**")
+    widths = [1, 2, 4, 2, 2, 4]
+    hdr = st.columns(widths)
+    for c, h in zip(hdr, ["**Net**", "**Type**", "**🔵 Squad A**", "**A score**",
+                          "**B score**", "**🔴 Squad B**"]):
+        c.markdown(h)
 
     scores = []
     net_winners = []
     has_tie = False
     for i in range(n_nets):
-        pa1, pa2 = pairs_a[i]
-        pb1, pb2 = pairs_b[i]
-        row = st.columns([1, 4, 2, 2, 4])
+        row = st.columns(widths)
         row[0].write(f"**{i+1}**")
-        row[1].write(f"{players[pa1]['name']} & {players[pa2]['name']}")
-        a_pts = row[2].number_input(
-            f"A score net {i+1}",
-            min_value=0, step=1, value=0,
-            label_visibility="collapsed",
-            key=f"score_a_{game_num}_{i}",
+        t = net_types[i]
+        row[1].write(f"{NET_ICONS[t]} {NET_LABELS[t]}" if t else "")
+        row[2].write(" & ".join(_pname(p, players, ranks_a) for p in pairs_a[i]))
+        a_pts = row[3].number_input(
+            f"A score net {i+1}", min_value=0, step=1, value=0,
+            label_visibility="collapsed", key=f"score_a_{match['id']}_{game_num}_{i}",
         )
-        b_pts = row[3].number_input(
-            f"B score net {i+1}",
-            min_value=0, step=1, value=0,
-            label_visibility="collapsed",
-            key=f"score_b_{game_num}_{i}",
+        b_pts = row[4].number_input(
+            f"B score net {i+1}", min_value=0, step=1, value=0,
+            label_visibility="collapsed", key=f"score_b_{match['id']}_{game_num}_{i}",
         )
-        row[4].write(f"{players[pb1]['name']} & {players[pb2]['name']}")
+        row[5].write(" & ".join(_pname(p, players, ranks_b) for p in pairs_b[i]))
         scores.append([int(a_pts), int(b_pts)])
         if a_pts > b_pts:
             net_winners.append("A")
@@ -659,11 +667,13 @@ def _step_results(data, match, players):
     if has_tie:
         st.warning("⚠️ Every net needs a winner — fix any tied scores before saving.")
 
+    next_side = setting_side(match, game_num + 1)
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("💾 Save & Play Another Game", type="primary", disabled=has_tie):
+        if st.button(f"💾 Save & Play Another Game ({SQUAD_NAME[next_side]} sets)",
+                     type="primary", disabled=has_tie):
             _commit_game_results(match, game, net_winners, scores, wins_a, wins_b)
-            match["step"] = "pairing"
+            match["step"] = "lineup"
             set_match(match)
             st.rerun()
     with c2:
