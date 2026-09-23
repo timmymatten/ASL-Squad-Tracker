@@ -1,22 +1,15 @@
 """
-K-means skill grouping.
+K-means performance clustering for the Home page chart (reference only — it never
+changes a player's roster group).
 
-Replaces manual skill-group assignment with KMeans(n_clusters=4) over one of two
-feature sets:
-
-  * "rating"      — each player's current Glicko-2 rating (1-D), from core.ratings.
-  * "performance" — each player's (win_rate, games_played) from this app's own stats,
-                    standardized so the two very-different scales weigh equally.
-
-Clusters are relabelled by centroid so numbering is stable match to match: Group 1 is
-always the strongest cluster, Group 4 the weakest. The output — {pid: group} with groups
-1..4 — is exactly what generate_squads / the pairing engine already consume, so nothing
-downstream changes.
+Clusters players with KMeans(n_clusters=4) on (win_rate, games_played) from this app's
+own stats, standardized so the two very-different scales weigh equally. Clusters are
+relabelled by centroid so Group 1 is always the strongest cluster.
 
 Edge cases handled:
-  * Fewer than 4 distinct feature values (small turnout) → fall back to k = #distinct.
-  * Players with no rating / zero games → assigned to the median cluster and flagged
-    ("unrated" / "insufficient data") so the UI can surface the fallback.
+  * Fewer than 4 distinct feature values → fall back to k = #distinct.
+  * Players with zero games → assigned to the median cluster and flagged
+    "insufficient data" so the UI can surface the fallback.
 """
 import statistics
 
@@ -24,13 +17,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
-from core import ratings as ratings_mod
-
-MODE_RATING = "rating"
-MODE_PERFORMANCE = "performance"
-DEFAULT_MODE = MODE_RATING
-
-MIN_GAMES_FOR_PERFORMANCE = 3  # "enough games played" threshold used for the home banner
+MIN_GAMES = 3  # "enough games played" threshold used for the home banner
 
 
 def _kmeans_labels(feature_matrix, k):
@@ -56,59 +43,6 @@ def _median_group(assigned_groups, k):
     if assigned_groups:
         return max(1, min(k, int(round(statistics.median(assigned_groups)))))
     return (k + 1) // 2
-
-
-def cluster_by_rating(pids, players):
-    """
-    Cluster the given player ids by Glicko-2 rating. Returns a result dict (see
-    _result_shape below). Players without a rating are flagged "unrated" and placed
-    in the median cluster.
-    """
-    ratings, _unmatched = ratings_mod.player_ratings({pid: players[pid] for pid in pids})
-
-    rated = [pid for pid in pids if pid in ratings]
-    flagged = {pid: "unrated" for pid in pids if pid not in ratings}
-
-    groups = {}
-    centroids = []
-    distinct = sorted({round(ratings[pid], 6) for pid in rated})
-    k = min(4, len(distinct)) if distinct else 0
-
-    if k >= 1:
-        X = np.array([[ratings[pid]] for pid in rated], dtype=float)
-        labels, model = _kmeans_labels(X, k)
-        centroid_val = {lbl: float(model.cluster_centers_[lbl][0]) for lbl in set(labels)}
-        remap = _relabel_by_centroid(centroid_val)
-        for pid, lbl in zip(rated, labels):
-            groups[pid] = remap[lbl]
-        for lbl, grp in remap.items():
-            centroids.append({"group": grp, "rating": centroid_val[lbl]})
-        centroids.sort(key=lambda c: c["group"])
-
-    med = _median_group(list(groups.values()), max(k, 1))
-    for pid in flagged:
-        groups[pid] = med
-
-    # Underlying value per player for the viz/hover (defaulted → the median centroid rating).
-    med_rating = next((c["rating"] for c in centroids if c["group"] == med), None)
-    values = {}
-    for pid in pids:
-        values[pid] = {
-            "rating": ratings.get(pid, med_rating),
-            "defaulted": pid in flagged,
-        }
-
-    return {
-        "mode": MODE_RATING,
-        "groups": groups,
-        "flagged": flagged,
-        "values": values,
-        "centroids": centroids,
-        "k": k,
-        "n_players": len(pids),
-        "n_flagged": len(flagged),
-        "median_group": med,
-    }
 
 
 def cluster_by_performance(pids, players, stats):
@@ -169,7 +103,6 @@ def cluster_by_performance(pids, players, stats):
         }
 
     return {
-        "mode": MODE_PERFORMANCE,
         "groups": groups,
         "flagged": flagged,
         "values": values,
@@ -181,15 +114,7 @@ def cluster_by_performance(pids, players, stats):
     }
 
 
-def compute_clusters(mode, pids, players, stats=None):
-    """Dispatch to the right clustering function for `mode`."""
-    pids = list(pids)
-    if mode == MODE_PERFORMANCE:
-        return cluster_by_performance(pids, players, stats or {})
-    return cluster_by_rating(pids, players)
-
-
-def enough_games_summary(pids, stats, threshold=MIN_GAMES_FOR_PERFORMANCE):
+def enough_games_summary(pids, stats, threshold=MIN_GAMES):
     """Return (n_with_enough, total) for the home-page banner."""
     pids = list(pids)
     n = sum(1 for pid in pids if stats.get(pid, {}).get("games", 0) >= threshold)

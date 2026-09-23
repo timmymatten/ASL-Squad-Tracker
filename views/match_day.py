@@ -5,10 +5,9 @@ import random
 from datetime import date
 
 from core.constants import GROUP_LABELS, GROUP_COLORS
-from core.persistence import get_data, persist, get_clustering_mode
+from core.persistence import get_data, persist
 from core.match_state import get_match, set_match
 from core.stats import compute_stats, order_strength, MIN_ORDER_GAMES
-from core import clustering
 from core.algorithms import (
     generate_format_squads,
     player_attendance,
@@ -23,8 +22,10 @@ from core.lineups import (
     NET_LABELS,
     NET_ICONS,
     NET_SLOTS,
+    is_woman,
     split_pools,
-    squad_ranks,
+    default_rank_order,
+    ranks_from_order,
     rank_label,
     pair_score,
     net_gaps,
@@ -40,24 +41,6 @@ SQUAD_NAME = {"a": "🔵 Squad A", "b": "🔴 Squad B"}
 EMPTY = "—"
 
 
-def _effective_players(players, match):
-    """
-    Players with skill `group` overridden by the match day's k-means cluster assignment.
-
-    Clusters are computed once when squads are generated (see below) and stored on the
-    match as {pid: group}. Everything downstream — squad generation, ranking, lineups —
-    reads players[pid]["group"] unchanged; it just sees the clustered group instead of
-    the static roster group. Players not in the assignment keep their roster group.
-    """
-    groups = (match or {}).get("groups")
-    if not groups:
-        return players
-    return {
-        pid: ({**p, "group": groups[pid]} if pid in groups else p)
-        for pid, p in players.items()
-    }
-
-
 def page_match_day():
     data = get_data()
     players = data["players"]
@@ -71,7 +54,7 @@ def page_match_day():
             set_match(None)
             st.rerun()
         st.divider()
-        _match_in_progress(data, match, _effective_players(players, match))
+        _match_in_progress(data, match, players)
         return
 
     # ── New match day setup ──
@@ -145,23 +128,9 @@ def page_match_day():
     st.success(f"**{len(present)} players** → 2 squads of {OPEN_PER_SQUAD} open + "
                f"{WOMEN_PER_SQUAD} women, {N_NETS} nets per game")
 
-    # Preview which skill groups clustering will assign for this turnout.
-    mode = get_clustering_mode()
-    stats = compute_stats(data)
-    preview = clustering.compute_clusters(mode, present, players, stats)
-    mode_label = ("Rating-Based (Glicko-2)" if mode == clustering.MODE_RATING
-                  else "Performance-Based (win rate + games)")
-    st.caption(f"Skill groups will be set by **{mode_label}** k-means clustering "
-               f"(change on the 🏠 Home page). {preview['k']} groups from {len(present)} players.")
-    if preview["n_flagged"]:
-        flag_word = "unrated" if mode == clustering.MODE_RATING else "insufficient data"
-        st.caption(f"⚠️ {preview['n_flagged']} player(s) with {flag_word} → defaulted to "
-                   f"Group {preview['median_group']}.")
-
     if st.button("🏆 Generate Squads →", type="primary"):
-        groups = preview["groups"]
-        eff_players = _effective_players(players, {"groups": groups})
-        squad_a, squad_b = generate_format_squads(present, eff_players)
+        squad_a, squad_b = generate_format_squads(present, players)
+        stats = compute_stats(data)
         set_match(
             {
                 "id": str(uuid.uuid4())[:8],
@@ -175,27 +144,31 @@ def page_match_day():
                 "step": "squads",
                 # Coin flip: which squad sets the Game 1 lineup (then it alternates).
                 "setting_first": random.choice(["a", "b"]),
-                # k-means output, computed once here and reused for the whole match day.
-                "groups": groups,
-                "clustering": {
-                    "mode": preview["mode"],
-                    "k": preview["k"],
-                    "n_flagged": preview["n_flagged"],
-                    "median_group": preview["median_group"],
-                    "flagged": preview["flagged"],
-                    "centroids": preview["centroids"],
-                    "values": preview["values"],
+                # Within-squad rank order (open, then women). Starts in roster-group
+                # order; adjusted by hand on the squads screen.
+                "rank_order": {
+                    "a": default_rank_order(squad_a, stats, players),
+                    "b": default_rank_order(squad_b, stats, players),
                 },
             }
         )
         st.rerun()
 
 
+def _rank_order(match, side, players):
+    """The squad's manual rank order, (re)built from roster groups if missing or stale."""
+    orders = match.setdefault("rank_order", {})
+    squad = match[f"squad_{side}"]
+    order = orders.get(side)
+    if not order or sorted(order) != sorted(squad):
+        order = orders[side] = default_rank_order(squad, compute_stats(get_data()), players)
+    return order
+
+
 def _ranks(match, players):
-    """{pid: rank} per squad — open O1..O7, women W1..W3 (stats are fixed for the day)."""
-    stats = compute_stats(get_data())
-    return (squad_ranks(match["squad_a"], stats, players),
-            squad_ranks(match["squad_b"], stats, players))
+    """{pid: rank} per squad — open O1..O7, women W1..W3, from the manual rank order."""
+    return (ranks_from_order(_rank_order(match, "a", players), players),
+            ranks_from_order(_rank_order(match, "b", players), players))
 
 
 def _pname(pid, players, ranks):
@@ -227,9 +200,11 @@ def _match_in_progress(data, match, players):
         with c_b:
             _squad_display(match["squad_b"], players, ranks_b, SQUAD_NAME["b"])
 
-    if step in ("squads", "flip"):
+    if step == "flip":
         squads()
         st.divider()
+    elif step == "squads":
+        pass  # the squads step lists everyone in its ranking panel
     else:
         with st.expander("👥 Squads & ranks"):
             squads()
@@ -258,18 +233,9 @@ def _step_squads(match, players):
     st.subheader("Adjust Squads")
     st.caption(
         f"Each squad needs exactly {OPEN_PER_SQUAD} open + {WOMEN_PER_SQUAD} women, so swaps "
-        "are one-for-one within the same pool (open ↔ open, woman ↔ woman). Ranks update "
-        "automatically."
+        "are one-for-one within the same pool (open ↔ open, woman ↔ woman). A swapped-in "
+        "player takes the rank of the player they replace."
     )
-    meta = match.get("clustering")
-    if meta:
-        mode_label = ("Rating-Based" if meta["mode"] == clustering.MODE_RATING
-                      else "Performance-Based")
-        flagged_note = (f" · {meta['n_flagged']} defaulted to Group {meta['median_group']}"
-                        if meta.get("n_flagged") else "")
-        st.caption(f"🧮 Groups set by **{mode_label}** k-means "
-                   f"({meta['k']} clusters){flagged_note}. Locked for this match day.")
-
     def pid_label(pid):
         p = players[pid]
         return f"{p['name']} (G{p['group']}{', ♀' if p.get('gender') == 'F' else ''})"
@@ -288,31 +254,63 @@ def _step_squads(match, players):
         elif (players[swap_a].get("gender") == "F") != (players[swap_b].get("gender") == "F"):
             st.error("Swap open with open or woman with woman so both squads stay 7 + 3.")
         else:
+            # Hand the leaver's rank to the newcomer (before the squads change, so the
+            # current orders still match their squads).
+            for side, out, into in (("a", swap_a, swap_b), ("b", swap_b, swap_a)):
+                order = _rank_order(match, side, players)
+                order[order.index(out)] = into
             squad_a[squad_a.index(swap_a)] = swap_b
             squad_b[squad_b.index(swap_b)] = swap_a
             set_match(match)
             st.rerun()
 
     st.divider()
+    st.subheader("Rank Squads")
     st.caption(
-        "**Ranking:** open players and women are ranked separately within each squad — "
-        "by skill group, then by **average point differential per game** (Leaderboard +/− "
-        f"÷ games). Players with under {MIN_ORDER_GAMES} games sit in the middle of their "
-        "group until they've played enough. A pair's score is the sum of its two ranks; "
-        f"opposing pairs must be within ±{MATCH_TOLERANCE}."
+        "Open players (O1–O7) and women (W1–W3) are ranked separately; 1 = strongest. "
+        "Ranks start in roster-group order (ties broken by average point differential "
+        f"per game once a player has {MIN_ORDER_GAMES}+ games). Use ↑ / ↓ to reorder. A "
+        f"pair's score is the sum of its two ranks; opposing pairs must be within "
+        f"±{MATCH_TOLERANCE}."
     )
     stats = compute_stats(get_data())
-    with st.expander("Ranking detail"):
-        col_a, col_b = st.columns(2)
-        for col, squad, side in ((col_a, squad_a, "a"), (col_b, squad_b, "b")):
-            ranks = squad_ranks(squad, stats, players)
-            with col:
-                st.markdown(f"**{SQUAD_NAME[side]}**")
-                for pid in sorted(squad, key=lambda p: (players[p].get("gender") == "F", ranks[p])):
+
+    def move(side, pid, step):
+        order = _rank_order(match, side, players)
+        pool = [p for p in order if is_woman(players[p]) == is_woman(players[pid])]
+        j = pool.index(pid) + step
+        if 0 <= j < len(pool):
+            i1, i2 = order.index(pid), order.index(pool[j])
+            order[i1], order[i2] = order[i2], order[i1]
+            set_match(match)
+
+    def reset(side):
+        match["rank_order"][side] = default_rank_order(match[f"squad_{side}"], stats, players)
+        set_match(match)
+
+    col_a, col_b = st.columns(2)
+    for col, side in ((col_a, "a"), (col_b, "b")):
+        order = _rank_order(match, side, players)
+        ranks = ranks_from_order(order, players)
+        with col:
+            st.markdown(f"**{SQUAD_NAME[side]}**")
+            for woman in (False, True):
+                pool = [p for p in order if is_woman(players[p]) == woman]
+                st.caption("Women" if woman else "Open")
+                for k, pid in enumerate(pool):
+                    p = players[pid]
                     g = stats[pid]["games"]
-                    metric = (f"{order_strength(pid, stats):+.1f}/game" if g >= MIN_ORDER_GAMES
-                              else f"new ({g} g)")
-                    st.write(f"`{rank_label(pid, ranks, players)}` {players[pid]['name']} · {metric}")
+                    metric = (f"{order_strength(pid, stats):+.1f}/g" if g >= MIN_ORDER_GAMES
+                              else "new")
+                    row = st.columns([4.2, 0.9, 0.9])
+                    row[0].write(f"`{rank_label(pid, ranks, players)}` "
+                                 f"{GROUP_COLORS[p['group']]} {p['name']} — G{p['group']} · {metric}")
+                    row[1].button("↑", key=f"up_{match['id']}_{pid}", disabled=k == 0,
+                                  on_click=move, args=(side, pid, -1))
+                    row[2].button("↓", key=f"dn_{match['id']}_{pid}", disabled=k == len(pool) - 1,
+                                  on_click=move, args=(side, pid, 1))
+            st.button("↺ Reset to group order", key=f"reset_{match['id']}_{side}",
+                      on_click=reset, args=(side,))
 
     st.divider()
     problems = [f"{SQUAD_NAME[s]} {e}" for s in ("a", "b")

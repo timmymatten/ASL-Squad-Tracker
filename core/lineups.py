@@ -58,6 +58,22 @@ def squad_ranks(squad_ids, stats, players):
     return ranks
 
 
+def default_rank_order(squad_ids, stats, players):
+    """Starting order for a squad: open then women, each by roster group (then avg +/-)."""
+    open_ids, women_ids = split_pools(squad_ids, players)
+    return squad_order(open_ids, stats, players) + squad_order(women_ids, stats, players)
+
+
+def ranks_from_order(order, players):
+    """{pid: rank} from a manual order — open and women numbered separately from 1."""
+    counters, ranks = {"open": 0, "women": 0}, {}
+    for pid in order:
+        pool = "women" if is_woman(players[pid]) else "open"
+        counters[pool] += 1
+        ranks[pid] = counters[pool]
+    return ranks
+
+
 def rank_label(pid, ranks, players):
     return f"{'W' if is_woman(players[pid]) else 'O'}{ranks[pid]}"
 

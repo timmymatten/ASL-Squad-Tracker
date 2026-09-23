@@ -45,19 +45,3 @@ def persist(data):
     save_data(data)
     st.session_state.data = data
     st.session_state.data_for = active_dataset()
-
-
-# ── Dataset-level config (clustering mode, etc.) ─────────────────────────────
-# Stored under data["config"] so it persists with the dataset and holds across the
-# match day. Read defensively — older datasets predate the key.
-from core.clustering import DEFAULT_MODE  # noqa: E402
-
-
-def get_clustering_mode():
-    return get_data().get("config", {}).get("clustering_mode", DEFAULT_MODE)
-
-
-def set_clustering_mode(mode):
-    data = get_data()
-    data.setdefault("config", {})["clustering_mode"] = mode
-    persist(data)
