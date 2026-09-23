@@ -18,7 +18,7 @@ _client_resolved = False
 
 
 def _empty():
-    return {"players": {}, "match_days": []}
+    return {"players": {}, "match_days": [], "config": {}}
 
 
 def _normalize_url(url):

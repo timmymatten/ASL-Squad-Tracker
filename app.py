@@ -3,6 +3,7 @@ import streamlit as st
 
 from core.persistence import get_data, active_dataset, set_dataset, DATA_FILES
 from core.match_state import get_match
+from views.home import page_home
 from views.roster import page_roster
 from views.match_day import page_match_day
 from views.leaderboard import page_leaderboard
@@ -30,6 +31,7 @@ def main():
         pass
 
     pages = {
+        "🏠 Home": page_home,
         "📋 Roster": page_roster,
         "🎯 Match Day": page_match_day,
         "🏆 Leaderboard": page_leaderboard,

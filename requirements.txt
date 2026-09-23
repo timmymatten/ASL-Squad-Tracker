@@ -1,4 +1,6 @@
 streamlit==1.37.1
 pandas
 altair
+plotly
+scikit-learn
 supabase

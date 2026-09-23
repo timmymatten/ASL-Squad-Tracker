@@ -2,6 +2,7 @@ import streamlit as st
 
 from core.constants import GROUP_COLORS
 from core.persistence import get_data, persist
+from core.lineups import SHAPES, NET_LABELS, NET_ICONS
 
 
 def page_history():
@@ -77,6 +78,9 @@ def page_history():
                 gw_str = "🔵 A" if gw == "a" else ("🔴 B" if gw == "b" else "Tie")
 
                 st.markdown(f"---\n**Game {game['game_num']}** — A: {ga} nets, B: {gb} nets → {gw_str}")
+                if game.get("setting") and game.get("shape") in SHAPES:
+                    setter = "🔵 A" if game["setting"] == "a" else "🔴 B"
+                    st.caption(f"{setter} set {SHAPES[game['shape']]['label']}")
 
                 sit_a = game.get("sit_a")
                 sit_b = game.get("sit_b")
@@ -89,6 +93,7 @@ def page_history():
                 pairs_b = game.get("pairings_b", [])
                 scores = game.get("scores") or []
 
+                net_types = game.get("net_types") or []
                 hdr = st.columns([1, 4, 2, 4])
                 hdr[0].markdown("**Net**")
                 hdr[1].markdown("**🔵 Squad A**")
@@ -104,7 +109,8 @@ def page_history():
                         win_icon = f"{scores[i][0]}–{scores[i][1]} {win_icon}"
 
                     row = st.columns([1, 4, 2, 4])
-                    row[0].write(f"**{i+1}**")
+                    t = net_types[i] if i < len(net_types) else None
+                    row[0].write(f"**{i+1}**" + (f" {NET_ICONS[t]} {NET_LABELS[t]}" if t else ""))
                     row[1].write(
                         " & ".join(pname(p) for p in pa) if pa else "—"
                     )

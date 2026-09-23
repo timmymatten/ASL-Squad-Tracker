@@ -1,75 +1,6 @@
 import random
 
-
-def squad_ranks(squad_ids, players):
-    """Return {pid: rank} where rank 1 = best skill (group 1 = lowest rank numbers)."""
-    sorted_ids = sorted(
-        squad_ids,
-        key=lambda p: (players[p]["group"], players[p]["name"]),
-    )
-    return {pid: i + 1 for i, pid in enumerate(sorted_ids)}
-
-
-def _perfect_matchings(lst):
-    """Yield all perfect matchings of a list."""
-    if not lst:
-        yield []
-        return
-    first = lst[0]
-    for i in range(1, len(lst)):
-        partner = lst[i]
-        rest = lst[1:i] + lst[i + 1 :]
-        for tail in _perfect_matchings(rest):
-            yield [(first, partner)] + tail
-
-
-def _spread(pairs, ranks):
-    if not pairs:
-        return 0
-    scores = [ranks[a] + ranks[b] for a, b in pairs]
-    return max(scores) - min(scores)
-
-
-PAIRING_SLACK = 2  # how far above the best pair-score spread an alternate matchup may stray
-NET_VARIANCE_MAX = 3  # max allowed gap between opposing pair rank-sums on a net
-
-
-def find_best_pairing(active_squad, ranks, forbidden, variant=None, slack=PAIRING_SLACK):
-    """
-    Return a perfect matching of active_squad that avoids all forbidden frozensets
-    (falling back to ignoring forbidden if none qualify).
-
-    variant=None (default): deterministic — the minimum pair-score-spread matching.
-        Identical to the original behavior.
-    variant=<int>: pick from the near-optimal matchings (spread within `slack` of the
-        best), rotating by the integer so consecutive values yield different — and not
-        necessarily zero-spread — matchups. Powers the UI's "Regenerate" button.
-    """
-    LIMIT = 10_000  # cap for very large squads
-
-    def collect(relax):
-        out = []
-        for i, matching in enumerate(_perfect_matchings(list(active_squad))):
-            if i >= LIMIT:
-                break
-            if not relax and any(frozenset(p) in forbidden for p in matching):
-                continue
-            out.append(matching)
-        return out
-
-    candidates = collect(relax=False) or collect(relax=True)
-    if not candidates:
-        return None
-
-    spreads = [_spread(m, ranks) for m in candidates]
-    best_spread = min(spreads)
-
-    if variant is None:
-        return candidates[spreads.index(best_spread)]
-
-    pool = [m for m, sp in zip(candidates, spreads) if sp <= best_spread + slack]
-    pool.sort(key=lambda m: _spread(m, ranks))
-    return pool[variant % len(pool)]
+from core.lineups import OPEN_PER_SQUAD, WOMEN_PER_SQUAD, split_pools
 
 
 def generate_squads(present_ids, players):
@@ -98,65 +29,16 @@ def generate_squads(present_ids, players):
     return squad_a, squad_b
 
 
-def pick_sitter(squad_ids, sit_history, rng=None):
+def generate_format_squads(present_ids, players):
     """
-    Rotate sitters so no player sits more than 2 games in a row.
-    sit_history is an ordered list of pids who sat (oldest first).
-    Pass rng (a random.Random) to make the tie-break reproducible.
+    Split a full turnout (2×7 open, 2×3 women) into two squads: the open pool and the
+    women's pool are each split skill-balanced on their own, so every squad gets exactly
+    7 open players and 3 women.
     """
-    rng = rng or random
-    consec = {}
-    for pid in squad_ids:
-        cnt = 0
-        for past in reversed(sit_history):
-            if past == pid:
-                cnt += 1
-            else:
-                break
-        consec[pid] = cnt
-
-    eligible = [p for p in squad_ids if consec[p] < 2] or list(squad_ids)
-    never = [p for p in eligible if p not in sit_history]
-    if never:
-        return rng.choice(never)
-    last_idx = {p: max(i for i, x in enumerate(sit_history) if x == p) for p in eligible}
-    return min(last_idx, key=last_idx.get)
-
-
-def _enforce_gender_balance(squad_a, squad_b, players):
-    """
-    Ensure each squad has at least one woman by swapping if necessary.
-    Swaps the woman with the least skill disruption (same group preferred).
-    """
-    def women(sq):
-        return [p for p in sq if players[p].get("gender") == "F"]
-
-    sa, sb = list(squad_a), list(squad_b)
-
-    # If both already have a woman, nothing to do
-    if women(sa) and women(sb):
-        return sa, sb
-
-    # One squad has all women, other has none — move one woman across
-    if women(sa) and not women(sb):
-        donor, receiver = sa, sb
-    else:
-        donor, receiver = sb, sa
-
-    # Pick woman from donor whose group best matches the receiver's composition
-    donor_women = women(donor)
-    receiver_groups = [players[p]["group"] for p in receiver]
-    avg_recv = sum(receiver_groups) / len(receiver_groups) if receiver_groups else 2
-    move_w = min(donor_women, key=lambda p: abs(players[p]["group"] - avg_recv))
-
-    # Swap her with a man of similar group from receiver
-    receiver_men = [p for p in receiver if players[p].get("gender", "M") == "M"]
-    if receiver_men:
-        swap_target = min(receiver_men, key=lambda p: abs(players[p]["group"] - players[move_w]["group"]))
-        donor.remove(move_w);   receiver.remove(swap_target)
-        donor.append(swap_target); receiver.append(move_w)
-
-    return (sa, sb) if donor is sa else (sb, sa)
+    open_ids, women_ids = split_pools(present_ids, players)
+    oa, ob = generate_squads(open_ids, players)
+    wa, wb = generate_squads(women_ids, players)
+    return oa + wa, ob + wb
 
 
 def player_attendance(match_days):
@@ -170,7 +52,7 @@ def player_attendance(match_days):
     return counts
 
 
-def select_players_for_session(checked_ids, players, match_days, max_players=16):
+def select_players_for_session(checked_ids, players, match_days, max_players):
     """
     From the checked-in players, pick at most `max_players` giving priority
     to those with fewer completed match days, applied at the skill-group level.
@@ -214,6 +96,12 @@ def select_players_for_session(checked_ids, players, match_days, max_players=16)
     return selected, benched
 
 
-def sort_pairs_by_score(pairs, ranks):
-    """Sort pairs ascending by combined rank score so opponents align correctly."""
-    return sorted(pairs, key=lambda p: ranks[p[0]] + ranks[p[1]])
+def select_players_for_format(checked_ids, players, match_days):
+    """
+    Cap the open and women's pools separately at what two squads need (14 open, 6 women),
+    each by fewest match days attended within skill group. Returns (selected, benched).
+    """
+    open_ids, women_ids = split_pools(checked_ids, players)
+    so, bo = select_players_for_session(open_ids, players, match_days, 2 * OPEN_PER_SQUAD)
+    sw, bw = select_players_for_session(women_ids, players, match_days, 2 * WOMEN_PER_SQUAD)
+    return so + sw, bo + bw
